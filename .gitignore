@@ -1,0 +1,14 @@
+.vscode
+**.DS_Store
+**/build
+**/devel
+**/cmake-build-debug
+**/.idea
+**.bag
+**/.catkin_workspace
+**.csv
+**.bin
+**.zip
+**.ply
+**.pcd
+log/

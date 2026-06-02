@@ -1,0 +1,25 @@
+<launch>
+  <arg name="map_name" value="big_field" />
+
+  <arg name="config_file" default="$(arg map_name).yaml" />
+  <arg name="fsm_replan_time" default="0.25" />
+  <arg name="fsm_replan_time_after_traj_start" default="0.25" />
+  <arg name="fsm_replan_time_before_traj_end" default="0.35" />
+  <arg name="bubble_astar_resolution" default="0.25" />
+  <arg name="bubble_topo_cube_discrete_size" default="0.45" />
+
+  <include file="$(find highspeed_exp)/launch/algorithm.xml">
+    <arg name="config_file" value="$(arg config_file)" />
+    <arg name="fsm_replan_time" value="$(arg fsm_replan_time)" />
+    <arg name="fsm_replan_time_after_traj_start" value="$(arg fsm_replan_time_after_traj_start)" />
+    <arg name="fsm_replan_time_before_traj_end" value="$(arg fsm_replan_time_before_traj_end)" />
+    <arg name="bubble_astar_resolution" value="$(arg bubble_astar_resolution)" />
+    <arg name="bubble_topo_cube_discrete_size" value="$(arg bubble_topo_cube_discrete_size)" />
+  </include>
+  <param name="/fsm/replan_time" value="$(arg fsm_replan_time)" type="double" />
+  <node pkg="plan_manage" name="traj_server" type="traj_server" output="screen">
+    <remap from="/position_cmd" to="/planning/pos_cmd" />
+  </node>
+  <include file="$(find highspeed_exp)/launch/simulation_$(arg map_name).launch"/>
+  
+</launch>
