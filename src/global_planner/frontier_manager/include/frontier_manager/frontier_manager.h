@@ -9,6 +9,7 @@
 #pragma once
 #include "lidar_map/ikd_Tree.h"
 #include <bits/stdc++.h>
+#include <functional>
 #include <frontier_manager/raycast.h>
 #include <lidar_map/lidar_map.h>
 #include <pcl/kdtree/kdtree_flann.h>
@@ -196,6 +197,36 @@ struct SuperClusterInfo {
   Eigen::Vector3f waypoint;
 };
 
+struct HighSpeedViewScoreContext {
+  bool enabled = false;
+  bool log = false;
+  Eigen::Vector3f curr_pos = Eigen::Vector3f::Zero();
+  Eigen::Vector3f curr_vel = Eigen::Vector3f::Zero();
+  float curr_yaw = 0.0f;
+  double high_speed_threshold = 5.0;
+  double gain_weight = 1.0;
+  double progress_weight = 0.10;
+  double velocity_align_weight = 2.0;
+  double known_free_weight = 0.18;
+  double clearance_weight = 0.50;
+  double yaw_weight = 0.25;
+  double turn_weight = 1.20;
+  double backup_penalty = 8.0;
+  double known_free_max_len = 25.0;
+  double backup_required_len = 4.0;
+  double min_clearance = 0.45;
+  double query_step = 0.20;
+  bool corridor_cruise_enable = true;
+  double corridor_known_free_len = 18.0;
+  double corridor_min_alignment = 0.70;
+  double corridor_forward_weight = 0.35;
+  double corridor_lateral_penalty = 12.0;
+  std::function<double(const Eigen::Vector3d &, const Eigen::Vector3d &,
+                       double, double, double)>
+      forward_known_free;
+  std::function<double(const Eigen::Vector3d &)> clearance;
+};
+
 class FrontierManager {
 private:
   FrontierParam frtp_;
@@ -208,6 +239,7 @@ private:
   TopoGraph::Ptr graph_;
   ros::NodeHandle nh_;
   vector<Eigen::Vector3f> origin_viewpoints_;
+  HighSpeedViewScoreContext high_speed_view_ctx_;
   // frontier update functions:
   void update_lidar_pos();
   void update_updating_aabb(const PointVector &new_frt_pts);
@@ -275,6 +307,7 @@ public:
   void vizBestViewpoint();
   void updateFrontierClusters(vector<ClusterInfo::Ptr> &cluster_updated,
                               vector<int> &cluster_removed);
+  void setHighSpeedViewScoreContext(const HighSpeedViewScoreContext &ctx);
   void generateTSPViewpoints(Eigen::Vector3f &center_pose,
                              vector<TopoNode::Ptr> &viewpoints);
 };

@@ -4,8 +4,10 @@
 #include <path_searching/bubble_astar.h>
 
 #include <algorithm>
+#include <limits>
 #include <plan_manage/plan_container.hpp>
 #include <ros/ros.h>
+#include <string>
 #include <traj_utils/PolyTraj.h>
 #include <lidar_map/lidar_map.h>
 #include <random>
@@ -93,6 +95,35 @@ struct GcopterConfig {
   double velocityShortKnownFree;
   double velocityMediumKnownFree;
   double velocityLongKnownFree;
+  double safetyMapQueryStep;
+  bool safetyMapUnknownAsOccupiedForCommit;
+  bool safetyMapUnknownAsOccupiedForBackup;
+  bool safetyMapUnknownAllowedForExplore;
+  double brakeAccel;
+  double plannerLatency;
+  double controlLatency;
+  double safetyBrakeMargin;
+  double curvatureMinRadius;
+  bool velocityLogEnable;
+  double highSpeedModeThreshold;
+  double viewScoreGainWeight;
+  double viewScoreProgressWeight;
+  double viewScoreVelocityAlignWeight;
+  double viewScoreKnownFreeWeight;
+  double viewScoreClearanceWeight;
+  double viewScoreYawWeight;
+  double viewScoreTurnWeight;
+  double viewScoreBackupPenalty;
+  double viewScoreKnownFreeMaxLen;
+  double edgeTurnPenaltyWeight;
+  double edgeKnownFreePenaltyWeight;
+  double edgeBackupPenaltyWeight;
+  double edgeYawPenaltyWeight;
+  bool corridorCruiseEnable;
+  double corridorCruiseKnownFreeLength;
+  double corridorCruiseMinAlignment;
+  double corridorCruiseForwardWeight;
+  double corridorCruiseLateralPenalty;
 
   void init(const ros::NodeHandle &nh_priv) {
     nh_priv.getParam("DilateRadiusSoft", dilateRadiusSoft);
@@ -155,7 +186,97 @@ struct GcopterConfig {
     nh_priv.param("VelocityShortKnownFree", velocityShortKnownFree, 4.0);
     nh_priv.param("VelocityMediumKnownFree", velocityMediumKnownFree, 8.0);
     nh_priv.param("VelocityLongKnownFree", velocityLongKnownFree, maxVelMag);
+    nh_priv.param("SafetyMapQueryStep", safetyMapQueryStep, 0.20);
+    nh_priv.param("SafetyMapUnknownAsOccupiedForCommit",
+                  safetyMapUnknownAsOccupiedForCommit, true);
+    nh_priv.param("SafetyMapUnknownAsOccupiedForBackup",
+                  safetyMapUnknownAsOccupiedForBackup, true);
+    nh_priv.param("SafetyMapUnknownAllowedForExplore",
+                  safetyMapUnknownAllowedForExplore, true);
+    nh_priv.param("BrakeAccel", brakeAccel, backupMaxAcc);
+    nh_priv.param("PlannerLatency", plannerLatency, 0.12);
+    nh_priv.param("ControlLatency", controlLatency, 0.08);
+    nh_priv.param("SafetyBrakeMargin", safetyBrakeMargin, 0.8);
+    nh_priv.param("CurvatureMinRadius", curvatureMinRadius, 0.8);
+    nh_priv.param("VelocityLogEnable", velocityLogEnable, true);
+    nh_priv.param("HighSpeedModeThreshold", highSpeedModeThreshold, 5.0);
+    nh_priv.param("ViewScoreGainWeight", viewScoreGainWeight, 1.0);
+    nh_priv.param("ViewScoreProgressWeight", viewScoreProgressWeight, 0.10);
+    nh_priv.param("ViewScoreVelocityAlignWeight", viewScoreVelocityAlignWeight, 2.0);
+    nh_priv.param("ViewScoreKnownFreeWeight", viewScoreKnownFreeWeight, 0.18);
+    nh_priv.param("ViewScoreClearanceWeight", viewScoreClearanceWeight, 0.50);
+    nh_priv.param("ViewScoreYawWeight", viewScoreYawWeight, 0.25);
+    nh_priv.param("ViewScoreTurnWeight", viewScoreTurnWeight, 1.20);
+    nh_priv.param("ViewScoreBackupPenalty", viewScoreBackupPenalty, 8.0);
+    nh_priv.param("ViewScoreKnownFreeMaxLen", viewScoreKnownFreeMaxLen, 25.0);
+    nh_priv.param("EdgeTurnPenaltyWeight", edgeTurnPenaltyWeight, 1.0);
+    nh_priv.param("EdgeKnownFreePenaltyWeight", edgeKnownFreePenaltyWeight, 0.45);
+    nh_priv.param("EdgeBackupPenaltyWeight", edgeBackupPenaltyWeight, 15.0);
+    nh_priv.param("EdgeYawPenaltyWeight", edgeYawPenaltyWeight, 0.20);
+    nh_priv.param("CorridorCruiseEnable", corridorCruiseEnable, true);
+    nh_priv.param("CorridorCruiseKnownFreeLength",
+                  corridorCruiseKnownFreeLength, knownFreeLongLength);
+    nh_priv.param("CorridorCruiseMinAlignment",
+                  corridorCruiseMinAlignment, 0.70);
+    nh_priv.param("CorridorCruiseForwardWeight",
+                  corridorCruiseForwardWeight, 0.35);
+    nh_priv.param("CorridorCruiseLateralPenalty",
+                  corridorCruiseLateralPenalty, 12.0);
   }
+};
+
+enum class MapVoxelState {
+  OCCUPIED = 0,
+  KNOWN_FREE = 1,
+  UNKNOWN = 2,
+  OUT_OF_MAP = 3
+};
+
+struct RaycastSafetyInfo {
+  bool all_known_free = false;
+  bool blocked_by_occupied = false;
+  bool blocked_by_unknown = false;
+  double length = 0.0;
+  double known_free_length = 0.0;
+  double min_clearance = std::numeric_limits<double>::infinity();
+  Eigen::Vector3d first_blocked_pos = Eigen::Vector3d::Zero();
+  MapVoxelState first_blocked_state = MapVoxelState::UNKNOWN;
+};
+
+struct SegmentSafetyInfo {
+  double path_length = 0.0;
+  double known_free_length = 0.0;
+  double min_clearance = std::numeric_limits<double>::infinity();
+  double turn_angle = 0.0;
+  double yaw_delta = 0.0;
+  double current_speed = 0.0;
+  bool backup_feasible = false;
+};
+
+struct SegmentVelocityLimit {
+  double final_limit = 0.0;
+  double open = 0.0;
+  double known_free = 0.0;
+  double brake = 0.0;
+  double clearance = 0.0;
+  double curvature = 0.0;
+  double yaw = 0.0;
+  double backup = 0.0;
+  std::string reason = "open";
+};
+
+struct EdgeSafetyCost {
+  double total_cost = 0.0;
+  double time_cost = 0.0;
+  double turn_penalty = 0.0;
+  double known_free_penalty = 0.0;
+  double backup_penalty = 0.0;
+  double yaw_penalty = 0.0;
+  double path_length = 0.0;
+  double known_free_length = 0.0;
+  double min_clearance = std::numeric_limits<double>::infinity();
+  double turn_angle = 0.0;
+  bool backup_feasible = false;
 };
 
 class FastPlannerManager {
@@ -182,6 +303,40 @@ public:
   bool isOnCommittedBackup() const;
   bool updateRogMap(const sensor_msgs::PointCloud2ConstPtr &cloud_msg,
                     const nav_msgs::Odometry::ConstPtr &odom_msg);
+  bool isSafetyMapReady() const;
+  MapVoxelState querySafetyState(const Eigen::Vector3d &pos) const;
+  const char *safetyStateName(MapVoxelState state) const;
+  double safetyDistanceToOcc(const Eigen::Vector3d &pos) const;
+  RaycastSafetyInfo raycastSafety(const Eigen::Vector3d &start,
+                                  const Eigen::Vector3d &end,
+                                  bool unknown_as_occupied,
+                                  double safe_distance,
+                                  double step) const;
+  double forwardKnownFreeLength(const Eigen::Vector3d &start,
+                                const Eigen::Vector3d &direction,
+                                double max_len,
+                                double safe_distance,
+                                double step) const;
+  bool checkTrajectoryKnownFree(const Trajectory<7> &traj,
+                                double safe_distance,
+                                double step,
+                                bool unknown_as_occupied) const;
+  double estimatePathKnownFreeLength(const vector<Eigen::Vector3d> &path,
+                                     double safe_distance,
+                                     double step) const;
+  double estimatePathMinClearance(const vector<Eigen::Vector3d> &path,
+                                  double step) const;
+  double estimatePathTurnAngle(const vector<Eigen::Vector3d> &path) const;
+  SegmentSafetyInfo evaluatePathSegmentSafety(const vector<Eigen::Vector3d> &path,
+                                              double yaw1,
+                                              double yaw2) const;
+  SegmentVelocityLimit computeSegmentVelocityLimit(
+      const SegmentSafetyInfo &info) const;
+  EdgeSafetyCost estimateHighSpeedEdgeCost(const vector<Eigen::Vector3f> &path,
+                                           const Eigen::Vector3d &start_vel,
+                                           double yaw1,
+                                           double yaw2) const;
+  void printSafetyMapSummary() const;
 
   bool YawTrajOpt(double &start_yaw, double &end_yaw, bool is_static, bool use_shorten_path);
   bool YawTrajwithoutOpt(double &start_yaw, double &end_yaw, bool is_static, bool use_shorten_path);

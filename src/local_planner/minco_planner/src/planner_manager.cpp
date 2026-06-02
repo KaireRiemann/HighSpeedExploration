@@ -228,6 +228,16 @@ double pathLength(const std::vector<Eigen::Vector3d> &path) {
   return len;
 }
 
+double normalizeAngleDiff(double angle) {
+  while (angle > M_PI) {
+    angle -= 2.0 * M_PI;
+  }
+  while (angle < -M_PI) {
+    angle += 2.0 * M_PI;
+  }
+  return angle;
+}
+
 Eigen::Vector3d terminalDirection(const std::vector<Eigen::Vector3d> &path) {
   for (int i = static_cast<int>(path.size()) - 1; i > 0; --i) {
     Eigen::Vector3d dir = path[static_cast<std::size_t>(i)] -
@@ -580,74 +590,241 @@ bool FastPlannerManager::isLioSegmentSafe(const Eigen::Vector3d &start,
   return true;
 }
 
-bool FastPlannerManager::isStateKnownFree(const Eigen::Vector3d &pos,
-                                          double safe_distance) const {
+bool FastPlannerManager::isSafetyMapReady() const {
+  return isRogReady() || lidar_map_interface_ != nullptr;
+}
+
+const char *FastPlannerManager::safetyStateName(MapVoxelState state) const {
+  switch (state) {
+  case MapVoxelState::OCCUPIED:
+    return "occupied";
+  case MapVoxelState::KNOWN_FREE:
+    return "known_free";
+  case MapVoxelState::UNKNOWN:
+    return "unknown";
+  case MapVoxelState::OUT_OF_MAP:
+    return "out_of_map";
+  default:
+    return "invalid";
+  }
+}
+
+double FastPlannerManager::safetyDistanceToOcc(const Eigen::Vector3d &pos) const {
+  if (!pos.allFinite() || !lidar_map_interface_) {
+    return -std::numeric_limits<double>::infinity();
+  }
+  return lidar_map_interface_->getDisToOcc(pos);
+}
+
+MapVoxelState FastPlannerManager::querySafetyState(
+    const Eigen::Vector3d &pos) const {
   if (!pos.allFinite()) {
-    return false;
-  }
-  const double lio_dist =
-      lidar_map_interface_ ? lidar_map_interface_->getDisToOcc(pos)
-                           : -std::numeric_limits<double>::infinity();
-  const bool lio_safe = lio_dist >= safe_distance;
-  if (!isRogReady()) {
-    return lio_safe;
-  }
-  const auto inf_state = map_manager_->getPolicyGridType(
-      pos, general_planner::MapBackend::ROG, true);
-  if (inf_state == rog_map::GridType::KNOWN_FREE) {
-    return map_manager_->isStateSafe(pos, safe_distance,
-                                     general_planner::MapBackend::ROG) ||
-           (gcopter_config_->rogKnownFreeFallbackToLio && lio_safe);
+    return MapVoxelState::OUT_OF_MAP;
   }
 
+  const double safe_distance =
+      gcopter_config_ ? std::max(0.05, gcopter_config_->commitKnownFreeSafeDistance)
+                      : 0.45;
+  const double lio_dist = safetyDistanceToOcc(pos);
+  const bool lio_safe = std::isfinite(lio_dist) && lio_dist >= safe_distance;
+
+  if (!isRogReady()) {
+    if (!lidar_map_interface_) {
+      return MapVoxelState::UNKNOWN;
+    }
+    return lio_safe ? MapVoxelState::KNOWN_FREE : MapVoxelState::OCCUPIED;
+  }
+
+  const auto inf_state = map_manager_->getPolicyGridType(
+      pos, general_planner::MapBackend::ROG, true);
   const auto raw_state = map_manager_->getPolicyGridType(
       pos, general_planner::MapBackend::ROG, false);
+
+  if (inf_state == rog_map::GridType::OUT_OF_MAP ||
+      raw_state == rog_map::GridType::OUT_OF_MAP) {
+    return MapVoxelState::OUT_OF_MAP;
+  }
+  if (raw_state == rog_map::GridType::OCCUPIED ||
+      (inf_state == rog_map::GridType::OCCUPIED &&
+       raw_state == rog_map::GridType::KNOWN_FREE)) {
+    return MapVoxelState::OCCUPIED;
+  }
+  if (inf_state == rog_map::GridType::KNOWN_FREE ||
+      raw_state == rog_map::GridType::KNOWN_FREE) {
+    if (map_manager_->isStateSafe(pos, safe_distance,
+                                  general_planner::MapBackend::ROG) ||
+        (gcopter_config_ && gcopter_config_->rogKnownFreeFallbackToLio &&
+         lio_safe)) {
+      return MapVoxelState::KNOWN_FREE;
+    }
+    return MapVoxelState::OCCUPIED;
+  }
+
   const bool rog_unknown_like =
       inf_state == rog_map::GridType::UNKNOWN ||
       inf_state == rog_map::GridType::UNDEFINED ||
       inf_state == rog_map::GridType::FRONTIER ||
-      inf_state == rog_map::GridType::OUT_OF_MAP ||
-      ((inf_state == rog_map::GridType::OCCUPIED) &&
+      (inf_state == rog_map::GridType::OCCUPIED &&
        (raw_state == rog_map::GridType::UNKNOWN ||
         raw_state == rog_map::GridType::UNDEFINED ||
-        raw_state == rog_map::GridType::FRONTIER ||
-        raw_state == rog_map::GridType::OUT_OF_MAP));
-  if (gcopter_config_->rogKnownFreeFallbackToLio && lio_safe && rog_unknown_like) {
-    ROS_WARN_THROTTLE(2.0,
-                      "ROG known-free fallback to LIO is active: inf=%d raw=%d "
-                      "lio_dist=%.2f safe=%.2f pos=(%.2f, %.2f, %.2f)",
-                      static_cast<int>(inf_state), static_cast<int>(raw_state),
-                      lio_dist, safe_distance, pos.x(), pos.y(), pos.z());
-    return true;
+        raw_state == rog_map::GridType::FRONTIER));
+  if (gcopter_config_ && gcopter_config_->rogKnownFreeFallbackToLio &&
+      lio_safe && rog_unknown_like) {
+    return MapVoxelState::KNOWN_FREE;
   }
-  ROS_WARN_THROTTLE(2.0,
-                    "Known-free reject: inf=%d raw=%d lio_dist=%.2f safe=%.2f "
-                    "pos=(%.2f, %.2f, %.2f)",
-                    static_cast<int>(inf_state), static_cast<int>(raw_state),
-                    lio_dist, safe_distance, pos.x(), pos.y(), pos.z());
-  return false;
+  return MapVoxelState::UNKNOWN;
+}
+
+RaycastSafetyInfo FastPlannerManager::raycastSafety(
+    const Eigen::Vector3d &start,
+    const Eigen::Vector3d &end,
+    bool unknown_as_occupied,
+    double safe_distance,
+    double step) const {
+  RaycastSafetyInfo info;
+  if (!start.allFinite() || !end.allFinite()) {
+    info.blocked_by_unknown = true;
+    info.first_blocked_state = MapVoxelState::OUT_OF_MAP;
+    return info;
+  }
+
+  const Eigen::Vector3d delta = end - start;
+  info.length = delta.norm();
+  const int samples = std::max(
+      1, static_cast<int>(std::ceil(info.length / std::max(1.0e-3, step))));
+  Eigen::Vector3d prev = start;
+  info.all_known_free = true;
+  for (int i = 0; i <= samples; ++i) {
+    const double ratio = static_cast<double>(i) / static_cast<double>(samples);
+    const Eigen::Vector3d p = start + ratio * delta;
+    const MapVoxelState state = querySafetyState(p);
+    const double dist = safetyDistanceToOcc(p);
+    if (std::isfinite(dist)) {
+      info.min_clearance = std::min(info.min_clearance, dist);
+    }
+
+    const bool too_close =
+        std::isfinite(dist) && dist < std::max(0.0, safe_distance);
+    const bool unknown_block =
+        unknown_as_occupied &&
+        (state == MapVoxelState::UNKNOWN || state == MapVoxelState::OUT_OF_MAP);
+    const bool occupied_block =
+        state == MapVoxelState::OCCUPIED || too_close;
+    if (occupied_block || unknown_block) {
+      info.all_known_free = false;
+      info.first_blocked_pos = p;
+      info.first_blocked_state = state;
+      info.blocked_by_occupied = occupied_block;
+      info.blocked_by_unknown = unknown_block;
+      return info;
+    }
+
+    if (i > 0) {
+      info.known_free_length += (p - prev).norm();
+    }
+    prev = p;
+  }
+  if (!std::isfinite(info.min_clearance)) {
+    info.min_clearance = safetyDistanceToOcc(start);
+  }
+  return info;
+}
+
+double FastPlannerManager::forwardKnownFreeLength(
+    const Eigen::Vector3d &start,
+    const Eigen::Vector3d &direction,
+    double max_len,
+    double safe_distance,
+    double step) const {
+  if (!start.allFinite() || !direction.allFinite() ||
+      direction.norm() < 1.0e-4 || max_len <= 0.0) {
+    return 0.0;
+  }
+  const Eigen::Vector3d dir = direction.normalized();
+  const int samples = std::max(
+      1, static_cast<int>(std::ceil(max_len / std::max(1.0e-3, step))));
+  double known_free_len = 0.0;
+  Eigen::Vector3d prev = start;
+  for (int i = 0; i <= samples; ++i) {
+    const double len = std::min(max_len, i * std::max(1.0e-3, step));
+    const Eigen::Vector3d p = start + len * dir;
+    const MapVoxelState state = querySafetyState(p);
+    const double dist = safetyDistanceToOcc(p);
+    if (state != MapVoxelState::KNOWN_FREE ||
+        (std::isfinite(dist) && dist < safe_distance)) {
+      break;
+    }
+    if (i > 0) {
+      known_free_len += (p - prev).norm();
+    }
+    prev = p;
+  }
+  return known_free_len;
+}
+
+bool FastPlannerManager::checkTrajectoryKnownFree(
+    const Trajectory<7> &traj,
+    double safe_distance,
+    double step,
+    bool unknown_as_occupied) const {
+  if (traj.getPieceNum() <= 0) {
+    return false;
+  }
+  const double duration = traj.getTotalDuration();
+  if (!std::isfinite(duration) || duration <= 0.0) {
+    return false;
+  }
+  Eigen::Vector3d last = traj.getPos(0.0);
+  for (double t = step; t <= duration + 1.0e-6; t += step) {
+    const double tt = std::min(t, duration);
+    const Eigen::Vector3d p = traj.getPos(tt);
+    const auto info = raycastSafety(last, p, unknown_as_occupied,
+                                    safe_distance, step);
+    if (!info.all_known_free) {
+      return false;
+    }
+    last = p;
+    if (tt >= duration) {
+      break;
+    }
+  }
+  return true;
+}
+
+bool FastPlannerManager::isStateKnownFree(const Eigen::Vector3d &pos,
+                                          double safe_distance) const {
+  const MapVoxelState state = querySafetyState(pos);
+  const double dist = safetyDistanceToOcc(pos);
+  const bool safe = state == MapVoxelState::KNOWN_FREE &&
+                    (!std::isfinite(dist) || dist >= safe_distance);
+  if (!safe) {
+    ROS_WARN_THROTTLE(2.0,
+                      "Known-free reject: state=%s dist=%.2f safe=%.2f "
+                      "pos=(%.2f, %.2f, %.2f)",
+                      safetyStateName(state), dist, safe_distance,
+                      pos.x(), pos.y(), pos.z());
+  }
+  return safe;
 }
 
 bool FastPlannerManager::isSegmentKnownFree(const Eigen::Vector3d &start,
                                             const Eigen::Vector3d &end,
                                             double safe_distance,
                                             double step) const {
-  if (!start.allFinite() || !end.allFinite()) {
-    return false;
-  }
-  const double length = (end - start).norm();
-  const int samples =
-      std::max(1, static_cast<int>(std::ceil(length / std::max(1.0e-3, step))));
-  for (int i = 0; i <= samples; ++i) {
-    const double ratio = static_cast<double>(i) / static_cast<double>(samples);
-    if (!isStateKnownFree(start + ratio * (end - start), safe_distance)) {
-      return false;
-    }
-  }
-  return true;
+  const bool unknown_as_occupied =
+      !gcopter_config_ || gcopter_config_->safetyMapUnknownAsOccupiedForCommit;
+  return raycastSafety(start, end, unknown_as_occupied, safe_distance, step)
+      .all_known_free;
 }
 
 double FastPlannerManager::estimateKnownFreePathLength(
+    const vector<Eigen::Vector3d> &path,
+    double safe_distance,
+    double step) const {
+  return estimatePathKnownFreeLength(path, safe_distance, step);
+}
+
+double FastPlannerManager::estimatePathKnownFreeLength(
     const vector<Eigen::Vector3d> &path,
     double safe_distance,
     double step) const {
@@ -671,7 +848,7 @@ double FastPlannerManager::estimateKnownFreePathLength(
     for (int s = 1; s <= samples; ++s) {
       const double ratio = static_cast<double>(s) / static_cast<double>(samples);
       const Eigen::Vector3d p = last + ratio * (next - last);
-      if (!isSegmentKnownFree(prev, p, safe_distance, step)) {
+      if (!raycastSafety(prev, p, true, safe_distance, step).all_known_free) {
         return known_free_len;
       }
       known_free_len += (p - prev).norm();
@@ -715,6 +892,293 @@ double FastPlannerManager::estimateLioSafePathLength(
     last = next;
   }
   return safe_len;
+}
+
+double FastPlannerManager::estimatePathMinClearance(
+    const vector<Eigen::Vector3d> &path,
+    double step) const {
+  if (path.empty()) {
+    return -std::numeric_limits<double>::infinity();
+  }
+  double min_clearance = std::numeric_limits<double>::infinity();
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    const Eigen::Vector3d start = path[i - 1];
+    const Eigen::Vector3d end = path[i];
+    const double len = (end - start).norm();
+    const int samples =
+        std::max(1, static_cast<int>(std::ceil(len / std::max(1.0e-3, step))));
+    for (int s = 0; s <= samples; ++s) {
+      const double ratio = static_cast<double>(s) / static_cast<double>(samples);
+      const double dist = safetyDistanceToOcc(start + ratio * (end - start));
+      if (std::isfinite(dist)) {
+        min_clearance = std::min(min_clearance, dist);
+      }
+    }
+  }
+  if (!std::isfinite(min_clearance)) {
+    min_clearance = safetyDistanceToOcc(path.front());
+  }
+  return min_clearance;
+}
+
+double FastPlannerManager::estimatePathTurnAngle(
+    const vector<Eigen::Vector3d> &path) const {
+  if (path.size() < 3) {
+    return 0.0;
+  }
+  double turn_sum = 0.0;
+  for (std::size_t i = 1; i + 1 < path.size(); ++i) {
+    Eigen::Vector3d a = path[i] - path[i - 1];
+    Eigen::Vector3d b = path[i + 1] - path[i];
+    if (a.norm() < 1.0e-3 || b.norm() < 1.0e-3) {
+      continue;
+    }
+    const double dot = std::clamp(a.normalized().dot(b.normalized()), -1.0, 1.0);
+    turn_sum += std::acos(dot);
+  }
+  return turn_sum;
+}
+
+SegmentSafetyInfo FastPlannerManager::evaluatePathSegmentSafety(
+    const vector<Eigen::Vector3d> &path,
+    double yaw1,
+    double yaw2) const {
+  SegmentSafetyInfo info;
+  if (!gcopter_config_) {
+    return info;
+  }
+  info.path_length = pathLength(path);
+  const double step = std::max(0.05, gcopter_config_->safetyMapQueryStep);
+  const double safe_distance =
+      std::max(0.05, gcopter_config_->commitKnownFreeSafeDistance);
+  info.known_free_length =
+      estimatePathKnownFreeLength(path, safe_distance, step);
+  info.min_clearance = estimatePathMinClearance(path, step);
+  info.turn_angle = estimatePathTurnAngle(path);
+  info.yaw_delta = std::fabs(normalizeAngleDiff(yaw2 - yaw1));
+  info.current_speed = local_data_.curr_vel_.norm();
+
+  const double brake_acc =
+      std::max(1.0, gcopter_config_->brakeAccel);
+  const double latency =
+      std::max(0.0, gcopter_config_->plannerLatency) +
+      std::max(0.0, gcopter_config_->controlLatency);
+  const double stop_distance =
+      info.current_speed * latency +
+      info.current_speed * info.current_speed / (2.0 * brake_acc) +
+      std::max(0.0, gcopter_config_->safetyBrakeMargin);
+  info.backup_feasible =
+      info.known_free_length >=
+      std::max(gcopter_config_->knownFreeShortLength, stop_distance);
+  return info;
+}
+
+SegmentVelocityLimit FastPlannerManager::computeSegmentVelocityLimit(
+    const SegmentSafetyInfo &info) const {
+  SegmentVelocityLimit limit;
+  if (!gcopter_config_) {
+    limit.final_limit = 3.0;
+    return limit;
+  }
+
+  const double v_min = std::max(0.5, gcopter_config_->minSegmentVel);
+  const double v_global = std::max(v_min, gcopter_config_->maxVelMag);
+  limit.open = std::min(v_global,
+                        std::max(v_min, gcopter_config_->openSegmentVel));
+  limit.known_free = knownFreeAdaptiveVelocity(info.known_free_length);
+
+  const double brake_acc = std::max(1.0, gcopter_config_->brakeAccel);
+  const double latency =
+      std::max(0.0, gcopter_config_->plannerLatency) +
+      std::max(0.0, gcopter_config_->controlLatency);
+  const double brake_available =
+      info.known_free_length -
+      info.current_speed * latency -
+      std::max(0.0, gcopter_config_->safetyBrakeMargin);
+  limit.brake =
+      brake_available > 0.0
+          ? std::sqrt(2.0 * brake_acc * brake_available)
+          : v_min;
+
+  const double clearance_margin =
+      std::max(0.0, gcopter_config_->dynamicVelocityClearanceMargin);
+  if (std::isfinite(info.min_clearance) && info.min_clearance > clearance_margin) {
+    const double clearance_for_speed =
+        std::max(0.05, info.min_clearance - clearance_margin);
+    limit.clearance =
+        0.92 * std::sqrt(2.0 * gcopter_config_->maxAccMag * clearance_for_speed);
+  } else {
+    limit.clearance = v_min;
+  }
+  if (!gcopter_config_->dynamicVelocityEnable) {
+    limit.clearance = limit.open;
+  }
+
+  const double radius =
+      std::max(gcopter_config_->curvatureMinRadius,
+               std::isfinite(info.min_clearance) ? info.min_clearance
+                                                  : gcopter_config_->curvatureMinRadius);
+  const double turn_scale =
+      info.turn_angle > 0.15 ? std::max(0.15, info.turn_angle) : 0.15;
+  limit.curvature =
+      info.turn_angle > 0.15
+          ? std::sqrt(std::max(0.1, gcopter_config_->maxAccMag * radius /
+                                        turn_scale))
+          : limit.open;
+  if (info.turn_angle > 1.05) {
+    limit.curvature = std::min(limit.curvature, 4.5);
+  } else if (info.turn_angle > 0.65) {
+    limit.curvature = std::min(limit.curvature, 6.0);
+  }
+  if (!gcopter_config_->dynamicVelocityEnable) {
+    limit.curvature = limit.open;
+  }
+
+  limit.yaw = limit.open;
+  if (info.yaw_delta > 0.15 && gcopter_config_->yaw_max_vel > 1.0e-3) {
+    const double yaw_time = info.yaw_delta / gcopter_config_->yaw_max_vel;
+    limit.yaw = info.path_length / std::max(0.2, yaw_time);
+  }
+
+  limit.backup = info.backup_feasible ? limit.open
+                                      : gcopter_config_->velocityShortKnownFree;
+  const bool corridor_cruise =
+      gcopter_config_->corridorCruiseEnable &&
+      info.backup_feasible &&
+      info.known_free_length >= gcopter_config_->knownFreeMediumLength &&
+      info.turn_angle < 0.25 &&
+      info.yaw_delta < 0.35;
+  if (corridor_cruise) {
+    limit.clearance = limit.open;
+    limit.curvature = limit.open;
+    limit.yaw = limit.open;
+  }
+  const double raw_limit =
+      std::min({limit.open, limit.known_free, limit.brake, limit.clearance,
+                limit.curvature, limit.yaw, limit.backup});
+  limit.final_limit = std::clamp(raw_limit, v_min, gcopter_config_->maxVelMag);
+
+  if (raw_limit == limit.known_free) {
+    limit.reason = "known_free";
+  } else if (raw_limit == limit.brake) {
+    limit.reason = "brake";
+  } else if (raw_limit == limit.clearance) {
+    limit.reason = "clearance";
+  } else if (raw_limit == limit.curvature) {
+    limit.reason = "curvature";
+  } else if (raw_limit == limit.yaw) {
+    limit.reason = "yaw";
+  } else if (raw_limit == limit.backup) {
+    limit.reason = "backup";
+  } else {
+    limit.reason = "open";
+  }
+  return limit;
+}
+
+EdgeSafetyCost FastPlannerManager::estimateHighSpeedEdgeCost(
+    const vector<Eigen::Vector3f> &path,
+    const Eigen::Vector3d &start_vel,
+    double yaw1,
+    double yaw2) const {
+  EdgeSafetyCost cost;
+  if (path.size() < 2 || !gcopter_config_) {
+    cost.total_cost = 2e3;
+    return cost;
+  }
+
+  vector<Eigen::Vector3d> path_d;
+  path_d.reserve(path.size());
+  for (const auto &p : path) {
+    path_d.emplace_back(p.cast<double>());
+  }
+
+  SegmentSafetyInfo safety = evaluatePathSegmentSafety(path_d, yaw1, yaw2);
+  safety.current_speed = start_vel.norm();
+  const double brake_acc = std::max(1.0, gcopter_config_->brakeAccel);
+  const double latency =
+      std::max(0.0, gcopter_config_->plannerLatency) +
+      std::max(0.0, gcopter_config_->controlLatency);
+  const double stop_distance =
+      safety.current_speed * latency +
+      safety.current_speed * safety.current_speed / (2.0 * brake_acc) +
+      std::max(0.0, gcopter_config_->safetyBrakeMargin);
+  safety.backup_feasible =
+      safety.known_free_length >=
+      std::max(gcopter_config_->knownFreeShortLength, stop_distance);
+  const SegmentVelocityLimit vel_limit = computeSegmentVelocityLimit(safety);
+  cost.path_length = safety.path_length;
+  cost.known_free_length = safety.known_free_length;
+  cost.min_clearance = safety.min_clearance;
+  cost.turn_angle = safety.turn_angle;
+  cost.backup_feasible = safety.backup_feasible;
+
+  const double acc = std::max(1.0, gcopter_config_->maxAccMag);
+  const double vmax = std::max(0.5, vel_limit.final_limit);
+  const double accel_dist = vmax * vmax / acc;
+  if (cost.path_length <= accel_dist) {
+    cost.time_cost = 2.0 * std::sqrt(cost.path_length / acc);
+  } else {
+    cost.time_cost = 2.0 * vmax / acc + (cost.path_length - accel_dist) / vmax;
+  }
+
+  cost.turn_penalty =
+      gcopter_config_->edgeTurnPenaltyWeight * safety.turn_angle;
+  const double required_known =
+      std::min(cost.path_length,
+               std::max(gcopter_config_->knownFreeShortLength,
+                        start_vel.norm() *
+                            (gcopter_config_->plannerLatency +
+                             gcopter_config_->controlLatency) +
+                        start_vel.squaredNorm() /
+                            (2.0 * std::max(1.0, gcopter_config_->brakeAccel)) +
+                        gcopter_config_->safetyBrakeMargin));
+  if (cost.known_free_length + 1.0e-3 < required_known) {
+    cost.known_free_penalty =
+        gcopter_config_->edgeKnownFreePenaltyWeight *
+        (required_known - cost.known_free_length);
+  }
+  if (!cost.backup_feasible) {
+    cost.backup_penalty = gcopter_config_->edgeBackupPenaltyWeight;
+  }
+  cost.yaw_penalty =
+      gcopter_config_->edgeYawPenaltyWeight *
+      std::fabs(normalizeAngleDiff(yaw2 - yaw1)) /
+      std::max(0.1, gcopter_config_->yaw_max_vel);
+  cost.total_cost = cost.time_cost + cost.turn_penalty +
+                    cost.known_free_penalty + cost.backup_penalty +
+                    cost.yaw_penalty;
+
+  if (gcopter_config_->velocityLogEnable) {
+    ROS_INFO_STREAM_THROTTLE(
+        0.5,
+        "[edge cost] len=" << cost.path_length
+                           << " total=" << cost.total_cost
+                           << " time=" << cost.time_cost
+                           << " turn_pen=" << cost.turn_penalty
+                           << " known_pen=" << cost.known_free_penalty
+                           << " backup_pen=" << cost.backup_penalty
+                           << " yaw_pen=" << cost.yaw_penalty
+                           << " known_free=" << cost.known_free_length
+                           << " min_clearance=" << cost.min_clearance
+                           << " vel_limit=" << vel_limit.final_limit
+                           << " reason=" << vel_limit.reason
+                           << " backup_feasible=" << cost.backup_feasible);
+  }
+  return cost;
+}
+
+void FastPlannerManager::printSafetyMapSummary() const {
+  const Eigen::Vector3d pos = local_data_.curr_pos_;
+  const MapVoxelState state = querySafetyState(pos);
+  ROS_INFO_STREAM_THROTTLE(
+      1.0,
+      "[safety map] ready=" << isSafetyMapReady()
+                            << " rog_ready=" << isRogReady()
+                            << " state=" << safetyStateName(state)
+                            << " dist=" << safetyDistanceToOcc(pos)
+                            << " pos=(" << pos.x() << ", " << pos.y()
+                            << ", " << pos.z() << ")");
 }
 
 double FastPlannerManager::knownFreeAdaptiveVelocity(
@@ -843,6 +1307,10 @@ Eigen::VectorXd FastPlannerManager::computeCorridorVelocityLimits(
   int turn_limited = 0;
   int visible_limited = 0;
   int knownfree_limited = 0;
+  int brake_limited = 0;
+  int curvature_limited = 0;
+  int yaw_limited = 0;
+  int backup_limited = 0;
   int open_limited = 0;
   int min_idx = -1;
   double min_limit = std::numeric_limits<double>::infinity();
@@ -854,8 +1322,11 @@ Eigen::VectorXd FastPlannerManager::computeCorridorVelocityLimits(
   double min_v_turn = v_open;
   double min_v_visible = v_open;
   double min_v_knownfree = v_open;
+  double min_v_brake = v_open;
+  double min_v_yaw = v_open;
+  double min_v_backup = v_open;
   double min_knownfree_remaining = std::numeric_limits<double>::infinity();
-  const char *min_reason = "open";
+  std::string min_reason = "open";
   double known_free_path_len =
       use_known_free_velocity
           ? estimateKnownFreePathLength(
@@ -927,23 +1398,88 @@ Eigen::VectorXd FastPlannerManager::computeCorridorVelocityLimits(
     const double v_knownfree =
         use_known_free_velocity ? knownFreeAdaptiveVelocity(knownfree_remaining)
                                 : v_open;
-    const double raw_limit =
-        std::min({v_open, v_clearance, v_turn, v_visible, v_knownfree});
-    limits(i) = std::clamp(raw_limit, v_min, gcopter_config_->maxVelMag);
 
-    const char *reason = "open";
-    if (raw_limit == v_clearance) {
-      reason = "clearance";
+    SegmentSafetyInfo seg_safety;
+    seg_safety.path_length =
+        i + 1 < static_cast<int>(path.size()) ? (path[i + 1] - path[i]).norm()
+                                              : 0.0;
+    seg_safety.known_free_length = knownfree_remaining;
+    seg_safety.min_clearance = std::isfinite(clearance) ? clearance : open_clearance;
+    seg_safety.turn_angle = turn_angle;
+    seg_safety.yaw_delta = turn_angle;
+    seg_safety.current_speed = local_data_.curr_vel_.norm();
+    const double brake_acc = std::max(1.0, gcopter_config_->brakeAccel);
+    const double latency =
+        std::max(0.0, gcopter_config_->plannerLatency) +
+        std::max(0.0, gcopter_config_->controlLatency);
+    const double stop_distance =
+        seg_safety.current_speed * latency +
+        seg_safety.current_speed * seg_safety.current_speed / (2.0 * brake_acc) +
+        std::max(0.0, gcopter_config_->safetyBrakeMargin);
+    seg_safety.backup_feasible =
+        !use_known_free_velocity ||
+        knownfree_remaining >=
+            std::max(gcopter_config_->knownFreeShortLength, stop_distance);
+    SegmentVelocityLimit scheduled_limit =
+        computeSegmentVelocityLimit(seg_safety);
+    scheduled_limit.open = v_open;
+    const bool corridor_cruise_segment =
+        gcopter_config_->corridorCruiseEnable &&
+        seg_safety.backup_feasible &&
+        knownfree_remaining >= gcopter_config_->knownFreeMediumLength &&
+        turn_angle < 0.25;
+    scheduled_limit.clearance =
+        corridor_cruise_segment ? v_open
+                                : std::min(scheduled_limit.clearance, v_clearance);
+    scheduled_limit.curvature =
+        corridor_cruise_segment ? v_open
+                                : std::min(scheduled_limit.curvature, v_turn);
+    if (corridor_cruise_segment) {
+      scheduled_limit.yaw = v_open;
+    }
+    scheduled_limit.known_free = std::min(scheduled_limit.known_free, v_knownfree);
+    const double scheduled_raw_limit =
+        std::min({scheduled_limit.open, scheduled_limit.clearance,
+                  scheduled_limit.curvature, v_visible,
+                  scheduled_limit.known_free, scheduled_limit.brake,
+                  scheduled_limit.yaw, scheduled_limit.backup});
+    scheduled_limit.final_limit =
+        std::clamp(scheduled_raw_limit, v_min, gcopter_config_->maxVelMag);
+    if (scheduled_raw_limit == scheduled_limit.known_free) {
+      scheduled_limit.reason = "known_free";
+    } else if (scheduled_raw_limit == scheduled_limit.brake) {
+      scheduled_limit.reason = "brake";
+    } else if (scheduled_raw_limit == scheduled_limit.clearance) {
+      scheduled_limit.reason = "clearance";
+    } else if (scheduled_raw_limit == scheduled_limit.curvature) {
+      scheduled_limit.reason = "curvature";
+    } else if (scheduled_raw_limit == scheduled_limit.yaw) {
+      scheduled_limit.reason = "yaw";
+    } else if (scheduled_raw_limit == scheduled_limit.backup) {
+      scheduled_limit.reason = "backup";
+    } else if (scheduled_raw_limit == v_visible) {
+      scheduled_limit.reason = "visible";
+    } else {
+      scheduled_limit.reason = "open";
+    }
+    limits(i) = scheduled_limit.final_limit;
+
+    const std::string reason = scheduled_limit.reason;
+    if (reason == "clearance") {
       ++clearance_limited;
-    } else if (raw_limit == v_turn) {
-      reason = "turn";
+    } else if (reason == "curvature") {
       ++turn_limited;
-    } else if (raw_limit == v_visible) {
-      reason = "visible";
+      ++curvature_limited;
+    } else if (reason == "visible") {
       ++visible_limited;
-    } else if (raw_limit == v_knownfree) {
-      reason = "known_free";
+    } else if (reason == "known_free") {
       ++knownfree_limited;
+    } else if (reason == "brake") {
+      ++brake_limited;
+    } else if (reason == "yaw") {
+      ++yaw_limited;
+    } else if (reason == "backup") {
+      ++backup_limited;
     } else {
       ++open_limited;
     }
@@ -955,32 +1491,42 @@ Eigen::VectorXd FastPlannerManager::computeCorridorVelocityLimits(
       bottleneck_effective_clearance = effective_clearance;
       min_turn_angle = turn_angle;
       min_v_open = v_open;
-      min_v_clearance = v_clearance;
-      min_v_turn = v_turn;
+      min_v_clearance = scheduled_limit.clearance;
+      min_v_turn = scheduled_limit.curvature;
       min_v_visible = v_visible;
-      min_v_knownfree = v_knownfree;
+      min_v_knownfree = scheduled_limit.known_free;
+      min_v_brake = scheduled_limit.brake;
+      min_v_yaw = scheduled_limit.yaw;
+      min_v_backup = scheduled_limit.backup;
       min_knownfree_remaining = knownfree_remaining;
-      min_reason = reason;
+      min_reason = scheduled_limit.reason;
     }
     if (i + 1 < static_cast<int>(path.size())) {
       path_prefix_len += (path[i + 1] - path[i]).norm();
     }
   }
   if (limits.size() > 0) {
-    std::cout << "[vel diag] segments=" << limits.size()
-              << " limited(open/clearance/turn/visible/knownfree)=" << open_limited
-              << "/" << clearance_limited << "/" << turn_limited << "/"
-              << visible_limited << "/" << knownfree_limited << " min_idx=" << min_idx
-              << " reason=" << min_reason
-              << " final=" << min_limit
-              << " known_free_path_len=" << known_free_path_len
-              << " known_free_remaining=" << min_knownfree_remaining
-              << " clearance=" << bottleneck_clearance
-              << " effective_clearance=" << bottleneck_effective_clearance
-              << " turn_angle=" << min_turn_angle
-              << " components(open/clearance/turn/visible/knownfree)=" << min_v_open
-              << "/" << min_v_clearance << "/" << min_v_turn << "/"
-              << min_v_visible << "/" << min_v_knownfree << std::endl;
+    if (gcopter_config_->velocityLogEnable) {
+      std::cout << "[vel limit] segments=" << limits.size()
+                << " limited(open/clearance/curvature/visible/knownfree/brake/yaw/backup)="
+                << open_limited << "/" << clearance_limited << "/"
+                << curvature_limited << "/" << visible_limited << "/"
+                << knownfree_limited << "/" << brake_limited << "/"
+                << yaw_limited << "/" << backup_limited
+                << " min_idx=" << min_idx
+                << " reason=" << min_reason
+                << " final=" << min_limit
+                << " known_free_path_len=" << known_free_path_len
+                << " known_free_remaining=" << min_knownfree_remaining
+                << " clearance=" << bottleneck_clearance
+                << " effective_clearance=" << bottleneck_effective_clearance
+                << " turn_angle=" << min_turn_angle
+                << " components(open/clearance/curvature/visible/knownfree/brake/yaw/backup)="
+                << min_v_open << "/" << min_v_clearance << "/" << min_v_turn
+                << "/" << min_v_visible << "/" << min_v_knownfree << "/"
+                << min_v_brake << "/" << min_v_yaw << "/" << min_v_backup
+                << std::endl;
+    }
   }
   return limits;
 }
@@ -1479,7 +2025,20 @@ bool FastPlannerManager::planExploreTraj(const vector<Eigen::Vector3f> &path,
         local_data_.traj_id_ >= 1 && checkTrajCollision(time) && time > 2.0;
     if (!safe)
       return flyToSafeRegion(is_static);
-    // return false;
+    const Eigen::Vector3d current_p = iniState.col(0);
+    const double xy_radius =
+        std::max(0.8, gcopter_config_->dilateRadiusHard + 0.4);
+    const double z_radius =
+        std::max(0.5, gcopter_config_->dilateRadiusHard + 0.2);
+    hPolys.insert(hPolys.begin(),
+                  makeBoxHPoly(current_p - Eigen::Vector3d(xy_radius, xy_radius,
+                                                           z_radius),
+                               current_p + Eigen::Vector3d(xy_radius, xy_radius,
+                                                           z_radius)));
+    start_idx = 0;
+    std::cout << "[corridor diag] prepend current-state safety box: center=("
+              << current_p.transpose() << ") radius_xy=" << xy_radius
+              << " radius_z=" << z_radius << std::endl;
   }
   if (start_idx != 0) {
     hPolys.erase(hPolys.begin(), hPolys.begin() + start_idx);

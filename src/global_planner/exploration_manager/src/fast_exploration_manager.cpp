@@ -89,11 +89,9 @@ double FastExplorationManager::getPathCost(TopoNode::Ptr &n1,
       return 2e3 +
              (n1->center_ - n2->center_).norm(); // 同上，用于不同的错误情况
 
-    len_cost = 0.0;
-    for (int i = 0; i < path.size() - 1; ++i)
-      len_cost += ((path[i + 1] - path[i]).norm() +
-                   0.5 * fabs(path[i + 1].z() - path[i].z()));
-    len_cost /= (ep_->v_max_ / 2.0);
+    const EdgeSafetyCost edge_cost =
+        planner_manager_->estimateHighSpeedEdgeCost(path, v1, yaw1, yaw2);
+    len_cost = edge_cost.total_cost;
 
     // if (v1.norm() > 1e-3) {
     //   Eigen::Vector3f dir = n2->center_ - n1->center_;
@@ -133,9 +131,8 @@ double FastExplorationManager::getPathCostWithoutTopo(TopoNode::Ptr &n1,
       n1->center_, n2->center_, path, 1.0, false);
   if (res != ParallelBubbleAstar::REACH_END)
     return 2e3;
-  double cost;
-  planner_manager_->parallel_path_finder_->calculatePathCost(path, cost);
-  return cost;
+  return planner_manager_->estimateHighSpeedEdgeCost(path, v1, yaw1, yaw2)
+      .total_cost;
 }
 
 int FastExplorationManager::planGlobalPath(const Eigen::Vector3d &pos,
@@ -159,6 +156,63 @@ int FastExplorationManager::planGlobalPath(const Eigen::Vector3d &pos,
   };
   ros::Time start = ros::Time::now();
   vector<TopoNode::Ptr> viewpoints;
+  float curr_yaw = (float)planner_manager_->local_data_.curr_yaw_;
+  HighSpeedViewScoreContext view_ctx;
+  view_ctx.enabled = true;
+  view_ctx.log = planner_manager_->gcopter_config_->velocityLogEnable;
+  view_ctx.curr_pos = pos.cast<float>();
+  view_ctx.curr_vel = vel.cast<float>();
+  view_ctx.curr_yaw = curr_yaw;
+  view_ctx.high_speed_threshold =
+      planner_manager_->gcopter_config_->highSpeedModeThreshold;
+  view_ctx.gain_weight =
+      planner_manager_->gcopter_config_->viewScoreGainWeight;
+  view_ctx.progress_weight =
+      planner_manager_->gcopter_config_->viewScoreProgressWeight;
+  view_ctx.velocity_align_weight =
+      planner_manager_->gcopter_config_->viewScoreVelocityAlignWeight;
+  view_ctx.known_free_weight =
+      planner_manager_->gcopter_config_->viewScoreKnownFreeWeight;
+  view_ctx.clearance_weight =
+      planner_manager_->gcopter_config_->viewScoreClearanceWeight;
+  view_ctx.yaw_weight =
+      planner_manager_->gcopter_config_->viewScoreYawWeight;
+  view_ctx.turn_weight =
+      planner_manager_->gcopter_config_->viewScoreTurnWeight;
+  view_ctx.backup_penalty =
+      planner_manager_->gcopter_config_->viewScoreBackupPenalty;
+  view_ctx.known_free_max_len =
+      planner_manager_->gcopter_config_->viewScoreKnownFreeMaxLen;
+  view_ctx.backup_required_len =
+      planner_manager_->gcopter_config_->knownFreeShortLength;
+  view_ctx.min_clearance =
+      planner_manager_->gcopter_config_->commitKnownFreeSafeDistance;
+  view_ctx.query_step =
+      planner_manager_->gcopter_config_->safetyMapQueryStep;
+  view_ctx.corridor_cruise_enable =
+      planner_manager_->gcopter_config_->corridorCruiseEnable;
+  view_ctx.corridor_known_free_len =
+      planner_manager_->gcopter_config_->corridorCruiseKnownFreeLength;
+  view_ctx.corridor_min_alignment =
+      planner_manager_->gcopter_config_->corridorCruiseMinAlignment;
+  view_ctx.corridor_forward_weight =
+      planner_manager_->gcopter_config_->corridorCruiseForwardWeight;
+  view_ctx.corridor_lateral_penalty =
+      planner_manager_->gcopter_config_->corridorCruiseLateralPenalty;
+  view_ctx.forward_known_free =
+      [pm = planner_manager_](const Eigen::Vector3d &start,
+                              const Eigen::Vector3d &dir,
+                              double max_len,
+                              double safe_distance,
+                              double step) {
+        return pm->forwardKnownFreeLength(start, dir, max_len, safe_distance,
+                                          step);
+      };
+  view_ctx.clearance = [pm = planner_manager_](const Eigen::Vector3d &p) {
+    return pm->safetyDistanceToOcc(p);
+  };
+  frontier_manager_ptr_->setHighSpeedViewScoreContext(view_ctx);
+  planner_manager_->printSafetyMapSummary();
   frontier_manager_ptr_->generateTSPViewpoints(
       planner_manager_->topo_graph_->odom_node_->center_, viewpoints);
 
@@ -173,7 +227,6 @@ int FastExplorationManager::planGlobalPath(const Eigen::Vector3d &pos,
   ros::Time t2 = ros::Time::now();
   cout << "insert viewpoint to graph time: " << (t2 - t1).toSec() * 1000
        << " ms" << endl;
-  float curr_yaw = (float)planner_manager_->local_data_.curr_yaw_;
   vector<double> distance_odom2vp(viewpoints.size(), 0);
   vector<double> distance_lastgoal2vp(viewpoints.size(), 0);
   double dis2last_goal = 5e3;

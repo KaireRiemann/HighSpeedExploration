@@ -51,6 +51,25 @@ void FrontierManager::generateTSPViewpoints(Eigen::Vector3f&center,  vector<Topo
   unordered_set<ClusterInfo::Ptr> revp_clusters_set; // (re)-generate viewpoints clusters
   vector<float> distance_odom2cluster;
   vector<ClusterInfo::Ptr> old_clusters_within_consideration;
+  const HighSpeedViewScoreContext ctx = high_speed_view_ctx_;
+  const bool use_corridor_bias =
+      ctx.enabled && ctx.forward_known_free && ctx.corridor_cruise_enable;
+  Eigen::Vector3f heading_dir(std::cos(ctx.curr_yaw), std::sin(ctx.curr_yaw), 0.0f);
+  if (ctx.curr_vel.norm() > 0.5f) {
+    heading_dir = ctx.curr_vel.normalized();
+  }
+  if (heading_dir.norm() < 1.0e-3f) {
+    heading_dir = Eigen::Vector3f::UnitX();
+  }
+  const double heading_known_free =
+      use_corridor_bias
+          ? ctx.forward_known_free(ctx.curr_pos.cast<double>(),
+                                   heading_dir.cast<double>(),
+                                   ctx.known_free_max_len, ctx.min_clearance,
+                                   ctx.query_step)
+          : 0.0;
+  const bool corridor_cruise_mode =
+      use_corridor_bias && heading_known_free >= ctx.corridor_known_free_len;
   for (auto &cluster : cluster_list_) {
     if (cluster->is_dormant_ || !cluster->is_reachable_)
       continue;
@@ -60,6 +79,25 @@ void FrontierManager::generateTSPViewpoints(Eigen::Vector3f&center,  vector<Topo
     // float distance =
     // (center- cluster->center_).norm() + fabs(graph_->odom_node_->center_.z() - cluster->center_.z()) * 0.5;
     float distance = graph_->estimateRoughDistance(cluster->center_, cluster->odom_id_);
+    if (corridor_cruise_mode) {
+      Eigen::Vector3f to_cluster = cluster->center_ - ctx.curr_pos;
+      const float cluster_dist = to_cluster.norm();
+      if (cluster_dist > 1.0e-3f) {
+        const float align =
+            std::clamp(to_cluster.normalized().dot(heading_dir), -1.0f, 1.0f);
+        distance -= static_cast<float>(
+            ctx.corridor_forward_weight * std::max(0.0f, align) *
+            std::min<double>(cluster_dist, ctx.known_free_max_len));
+        if (align < ctx.corridor_min_alignment) {
+          distance += static_cast<float>(
+              ctx.corridor_lateral_penalty *
+              (ctx.corridor_min_alignment - align));
+        }
+        if (align < 0.0f) {
+          distance += static_cast<float>(ctx.corridor_lateral_penalty * (-align));
+        }
+      }
+    }
     distance_odom2cluster.push_back(distance);
   }
 
@@ -166,6 +204,7 @@ void FrontierManager::generateTSPViewpoints(Eigen::Vector3f&center,  vector<Topo
     vp_node->yaw_ = tsp_clusters[idx2[i]]->best_vp_yaw_;
     viewpoints.push_back(vp_node);
   }
-  ROS_INFO("vp cluster cost: %fms  ,remove unreachable cost: %fms, select vp cost: %fms", (t2 - t1).toSec() * 1000, (t3 - t2).toSec() * 1000,
+  ROS_INFO("vp cluster cost: %fms  ,remove unreachable cost: %fms, select vp cost: %fms",
+           (t2 - t1).toSec() * 1000, (t3 - t2).toSec() * 1000,
            (t4 - t3).toSec() * 1000);
 }

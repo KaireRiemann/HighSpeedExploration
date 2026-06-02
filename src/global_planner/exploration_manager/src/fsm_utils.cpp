@@ -1,8 +1,56 @@
 #include <highspeed_exp/expl_data.h>
 #include <highspeed_exp/fast_exploration_fsm.h>
 #include <algorithm>
+#include <cmath>
 #include <iomanip>
 #include <sstream>
+
+namespace {
+float segmentAngle(const Eigen::Vector3f &a, const Eigen::Vector3f &b) {
+  if (a.norm() < 1.0e-4f || b.norm() < 1.0e-4f) {
+    return 0.0f;
+  }
+  const float c = std::clamp(a.normalized().dot(b.normalized()), -1.0f, 1.0f);
+  return std::acos(c);
+}
+
+void conditionHighSpeedPath(vector<Eigen::Vector3f> &path) {
+  if (path.size() < 3) {
+    return;
+  }
+
+  vector<Eigen::Vector3f> compact;
+  compact.reserve(path.size());
+  compact.push_back(path.front());
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    if ((path[i] - compact.back()).norm() >= 0.20f ||
+        i + 1 == path.size()) {
+      compact.push_back(path[i]);
+    }
+  }
+
+  if (compact.size() < 3) {
+    path.swap(compact);
+    return;
+  }
+
+  vector<Eigen::Vector3f> conditioned;
+  conditioned.reserve(compact.size());
+  conditioned.push_back(compact.front());
+  for (std::size_t i = 1; i + 1 < compact.size(); ++i) {
+    const Eigen::Vector3f a = compact[i] - conditioned.back();
+    const Eigen::Vector3f b = compact[i + 1] - compact[i];
+    const float angle = segmentAngle(a, b);
+    const bool nearly_collinear = angle < 0.12f && a.norm() < 5.0f;
+    const bool tight_backtrack = angle > 2.35f && a.norm() < 0.8f;
+    if (!nearly_collinear && !tight_backtrack) {
+      conditioned.push_back(compact[i]);
+    }
+  }
+  conditioned.push_back(compact.back());
+  path.swap(conditioned);
+}
+}  // namespace
 
 void FastExplorationFSM::pubState() {
 
@@ -93,6 +141,62 @@ int FastExplorationFSM::callExplorationPlanner() {
     Eigen::Vector3d start_exp = info->minco_traj_.getPos(plan_finish_time_exp);
     path_next_goal.insert(path_next_goal.begin(), start_exp.cast<float>());
   }
+  const std::size_t raw_path_size = path_next_goal.size();
+  conditionHighSpeedPath(path_next_goal);
+  if (path_next_goal.size() >= 2 &&
+      planner_manager_->gcopter_config_->corridorCruiseEnable) {
+    const Eigen::Vector3d start = path_next_goal.front().cast<double>();
+    const Eigen::Vector3d goal = path_next_goal.back().cast<double>();
+    Eigen::Vector3d direct = goal - start;
+    Eigen::Vector3d direct_xy = direct;
+    direct_xy.z() = 0.0;
+    Eigen::Vector3d heading(std::cos(planner_manager_->local_data_.curr_yaw_),
+                            std::sin(planner_manager_->local_data_.curr_yaw_),
+                            0.0);
+    Eigen::Vector3d vel_dir = planner_manager_->local_data_.curr_vel_;
+    vel_dir.z() = 0.0;
+    if (vel_dir.norm() > 0.5) {
+      heading = vel_dir.normalized();
+    }
+    const double align =
+        direct_xy.norm() > 1.0e-3
+            ? std::clamp(direct_xy.normalized().dot(heading), -1.0, 1.0)
+            : 1.0;
+    const double direct_len = direct.norm();
+    const double safe_distance =
+        std::max(0.05, planner_manager_->gcopter_config_->commitKnownFreeSafeDistance);
+    const double query_step =
+        std::max(0.05, planner_manager_->gcopter_config_->safetyMapQueryStep);
+    const RaycastSafetyInfo direct_safety = planner_manager_->raycastSafety(
+        start, goal, true, safe_distance, query_step);
+    const bool direct_known_free =
+        direct_safety.all_known_free &&
+        direct_safety.known_free_length + 1.0e-3 >= direct_len;
+    if (direct_known_free &&
+        direct_safety.known_free_length >=
+            planner_manager_->gcopter_config_->knownFreeMediumLength &&
+        align >= planner_manager_->gcopter_config_->corridorCruiseMinAlignment) {
+      vector<Eigen::Vector3f> straight_path;
+      straight_path.push_back(path_next_goal.front());
+      const double step =
+          std::max(4.0, planner_manager_->gcopter_config_->knownFreeShortLength);
+      const int samples =
+          std::max(1, static_cast<int>(std::floor(direct_len / step)));
+      for (int s = 1; s < samples; ++s) {
+        const double ratio = static_cast<double>(s) / static_cast<double>(samples);
+        straight_path.push_back((start + ratio * direct).cast<float>());
+      }
+      straight_path.push_back(path_next_goal.back());
+      path_next_goal.swap(straight_path);
+      if (planner_manager_->gcopter_config_->velocityLogEnable) {
+        ROS_INFO_STREAM("[corridor cruise path] straighten direct known-free path:"
+                        << " len=" << direct_len
+                        << " align=" << align
+                        << " known_free=" << direct_safety.known_free_length
+                        << " pts=" << path_next_goal.size());
+      }
+    }
+  }
   vector<Eigen::Vector3f> path_next_goal_tmp;
   path_next_goal_tmp.push_back(path_next_goal[0]);
 
@@ -110,6 +214,32 @@ int FastExplorationFSM::callExplorationPlanner() {
     }
   }
   expl_manager_->ed_->path_next_goal_.swap(path_next_goal_tmp);
+  if (planner_manager_->gcopter_config_->velocityLogEnable) {
+    vector<Eigen::Vector3d> path_d;
+    path_d.reserve(expl_manager_->ed_->path_next_goal_.size());
+    for (const auto &p : expl_manager_->ed_->path_next_goal_) {
+      path_d.emplace_back(p.cast<double>());
+    }
+    const auto safety = planner_manager_->evaluatePathSegmentSafety(
+        path_d, planner_manager_->local_data_.curr_yaw_,
+        planner_manager_->local_data_.end_yaw_);
+    const auto limit = planner_manager_->computeSegmentVelocityLimit(safety);
+    ROS_INFO_STREAM(
+        "[path condition] raw_pts=" << raw_path_size
+                                    << " conditioned_pts=" << path_next_goal.size()
+                                    << " dense_pts="
+                                    << expl_manager_->ed_->path_next_goal_.size()
+                                    << " len=" << safety.path_length
+                                    << " known_free="
+                                    << safety.known_free_length
+                                    << " min_clearance="
+                                    << safety.min_clearance
+                                    << " turn=" << safety.turn_angle
+                                    << " backup_feasible="
+                                    << safety.backup_feasible
+                                    << " sched_v=" << limit.final_limit
+                                    << " reason=" << limit.reason);
+  }
   if (planner_manager_->planExploreTraj(expl_manager_->ed_->path_next_goal_, fd_->static_state_)) {
     traj_utils::PolyTraj poly_traj_msg;
     planner_manager_->polyTraj2ROSMsg(poly_traj_msg, info->start_time_);
@@ -158,6 +288,7 @@ void FastExplorationFSM::CloudOdomCallback(const sensor_msgs::PointCloud2ConstPt
   fd_->odom_yaw_ = (float)tf::getYaw(odom_->pose.pose.orientation);
   planner_manager_->local_data_.curr_pos_ = fd_->odom_pos_.cast<double>();
   planner_manager_->local_data_.curr_vel_ = fd_->odom_vel_.cast<double>();
+  planner_manager_->local_data_.curr_yaw_ = fd_->odom_yaw_;
   planner_manager_->topo_graph_->odom_node_->center_ = fd_->odom_pos_;
   fd_->have_odom_ = true;
   vector<ClusterInfo::Ptr> new_clusters;

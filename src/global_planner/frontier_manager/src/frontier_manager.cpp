@@ -10,6 +10,24 @@
 #include <pcl/filters/voxel_grid.h>
 #include <visualization_msgs/MarkerArray.h>
 size_t ByteArrayRaw::size = 0;
+
+namespace {
+float normalizeYawDiff(float angle) {
+  while (angle > static_cast<float>(M_PI)) {
+    angle -= static_cast<float>(2.0 * M_PI);
+  }
+  while (angle < -static_cast<float>(M_PI)) {
+    angle += static_cast<float>(2.0 * M_PI);
+  }
+  return angle;
+}
+}  // namespace
+
+void FrontierManager::setHighSpeedViewScoreContext(
+    const HighSpeedViewScoreContext &ctx) {
+  high_speed_view_ctx_ = ctx;
+}
+
 void FrontierManager::init(ros::NodeHandle &nh, LIOInterface::Ptr &lio_interface,
                            TopoGraph::Ptr graph) {
   nh_ = nh;
@@ -1022,10 +1040,31 @@ void FrontierManager::selectBestViewpoint(ClusterInfo::Ptr &cluster) {
   for (auto &vp_cluster : cluster->vp_clusters_) {
     vps.insert(vps.end(), vp_cluster.vps_.begin(), vp_cluster.vps_.end());
   }
-  vector<float> score(vps.size(), 0);
+  vector<double> score(vps.size(), 0.0);
+  vector<int> visible_gain(vps.size(), 0);
   vector<float> yaw(vps.size(), 0);
   vector<PointVector> occ_free_frts; // raycast成功，但没有考虑视角
   occ_free_frts.resize(vps.size(), PointVector());
+  const HighSpeedViewScoreContext ctx = high_speed_view_ctx_;
+  const bool use_high_speed_score =
+      ctx.enabled && ctx.forward_known_free && ctx.clearance;
+  Eigen::Vector3f heading_dir(std::cos(ctx.curr_yaw), std::sin(ctx.curr_yaw), 0.0f);
+  if (ctx.curr_vel.norm() > 0.5f) {
+    heading_dir = ctx.curr_vel.normalized();
+  }
+  if (heading_dir.norm() < 1.0e-3f) {
+    heading_dir = Eigen::Vector3f::UnitX();
+  }
+  const double heading_known_free =
+      use_high_speed_score
+          ? ctx.forward_known_free(ctx.curr_pos.cast<double>(),
+                                   heading_dir.cast<double>(),
+                                   ctx.known_free_max_len, ctx.min_clearance,
+                                   ctx.query_step)
+          : 0.0;
+  const bool corridor_cruise_mode =
+      use_high_speed_score && ctx.corridor_cruise_enable &&
+      heading_known_free >= ctx.corridor_known_free_len;
   RayCaster ray_caster;
   ray_caster.setParams(double(frtp_.cell_size_), frtp_.map_min_.cast<double>());
   for (int i = 0; i < vps.size(); i++) {
@@ -1096,17 +1135,77 @@ void FrontierManager::selectBestViewpoint(ClusterInfo::Ptr &cluster) {
                                max_element(yaw_score.begin(), yaw_score.end()));
     // if (yaw_score[max_yaw_idx] == 0)
     //   continue;
-    score[i] = yaw_score[max_yaw_idx];
+    visible_gain[i] = yaw_score[max_yaw_idx];
+    score[i] = visible_gain[i];
     // Eigen::Vector4f hs = cluster->view_halfspace_;
     // Eigen::Vector4f vp_h(vp.x(), vp.y(), vp.z(), 1.0);
     // if (vp_h.dot(hs) < -0.1) {
     //   score[i] *= (1.5 - vp_h.dot(hs));
     // }
     yaw[i] = (45.0 * (max_yaw_idx - 4) + 22.5) / 180.0 * M_PI;
+
+    if (use_high_speed_score && visible_gain[i] > 0) {
+      Eigen::Vector3f to_vp = vp - ctx.curr_pos;
+      const double dist = to_vp.norm();
+      if (dist > 1.0e-3) {
+        Eigen::Vector3f dir = to_vp.normalized();
+        const double speed = ctx.curr_vel.norm();
+        const double dot =
+            std::clamp<double>(dir.dot(heading_dir), -1.0, 1.0);
+        const double forward_progress =
+            std::max(0.0, dot) * std::min(dist, ctx.known_free_max_len);
+        const double velocity_alignment =
+            0.5 * (dot + 1.0);
+        const double known_free_len = ctx.forward_known_free(
+            ctx.curr_pos.cast<double>(), to_vp.cast<double>(),
+            ctx.known_free_max_len, ctx.min_clearance, ctx.query_step);
+        double clearance = ctx.clearance(vp.cast<double>());
+        if (!std::isfinite(clearance)) {
+          clearance = 0.0;
+        }
+        const double yaw_change =
+            std::fabs(normalizeYawDiff(yaw[i] - ctx.curr_yaw));
+        const double turn_angle =
+            speed > 0.5 ? std::acos(dot) : 0.0;
+        const bool high_speed_mode =
+            speed >= ctx.high_speed_threshold || corridor_cruise_mode;
+        const double align_weight =
+            ctx.velocity_align_weight * (high_speed_mode ? 1.6 : 1.0);
+        const double known_weight =
+            ctx.known_free_weight * (high_speed_mode ? 1.5 : 1.0);
+        const double turn_weight =
+            ctx.turn_weight * (high_speed_mode ? 1.6 : 1.0);
+        const bool backup_infeasible =
+            known_free_len < std::min(ctx.backup_required_len, dist) ||
+            clearance < ctx.min_clearance;
+        score[i] = ctx.gain_weight * visible_gain[i] +
+                   ctx.progress_weight * forward_progress +
+                   align_weight * velocity_alignment +
+                   known_weight *
+                       std::min(known_free_len, ctx.known_free_max_len) +
+                   ctx.clearance_weight * std::min(clearance, 5.0) -
+                   ctx.yaw_weight * yaw_change -
+                   turn_weight * turn_angle -
+                   (backup_infeasible ? ctx.backup_penalty : 0.0);
+        if (corridor_cruise_mode) {
+          const double alignment_bonus =
+              ctx.corridor_forward_weight * std::max(0.0, dot) *
+              std::min({dist, known_free_len, ctx.known_free_max_len});
+          const double lateral_penalty =
+              dot < ctx.corridor_min_alignment
+                  ? ctx.corridor_lateral_penalty *
+                        (ctx.corridor_min_alignment - dot)
+                  : 0.0;
+          const double backward_penalty =
+              dot < 0.0 ? ctx.corridor_lateral_penalty * (-dot) : 0.0;
+          score[i] += alignment_bonus - lateral_penalty - backward_penalty;
+        }
+      }
+    }
   }
   int best_vp_idx = std::distance(score.begin(),
                                   std::max_element(score.begin(), score.end()));
-  if (score[best_vp_idx] == 0) {
+  if (visible_gain[best_vp_idx] == 0) {
     cluster->is_reachable_ = false;
     cluster->vp_clusters_.clear();
   } else {
@@ -1127,6 +1226,22 @@ void FrontierManager::selectBestViewpoint(ClusterInfo::Ptr &cluster) {
       } else {
         tmp_idx -= vpc.vps_.size();
       }
+    }
+    if (ctx.log && use_high_speed_score) {
+      ROS_INFO_STREAM_THROTTLE(
+          0.5,
+          "[view score] cluster=" << cluster->id_
+                                  << " best_score=" << score[best_vp_idx]
+                                  << " visible_gain="
+                                  << visible_gain[best_vp_idx]
+                                  << " speed=" << ctx.curr_vel.norm()
+                                  << " corridor_cruise="
+                                  << corridor_cruise_mode
+                                  << " heading_known_free="
+                                  << heading_known_free
+                                  << " vp=(" << cluster->best_vp_.x()
+                                  << ", " << cluster->best_vp_.y()
+                                  << ", " << cluster->best_vp_.z() << ")");
     }
   }
 }

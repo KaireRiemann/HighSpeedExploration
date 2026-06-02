@@ -5,14 +5,11 @@ Panels:
     Property Tree Widget:
       Expanded:
         - /Axes1
-        - /global_planner1
         - /global_planner1/viewpoint_info1
         - /global_planner1/viewpoint_info1/MarkerArray1
         - /global_planner1/viewpoint_info1/MarkerArray1/Namespaces1
-        - /debug_info1
         - /debug_info1/label_map1/well_observed1
         - /explore_env1/buffered_cloud1/Autocompute Value Bounds1
-        - /topo_graph1
         - /topo_graph1/Namespaces1
       Splitter Ratio: 0.4589178264141083
     Tree Height: 1014
@@ -384,6 +381,77 @@ Visualization Manager:
         box id: true
       Queue Size: 100
       Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: PointCloud2
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.009999999776482582
+      Style: Flat Squares
+      Topic: /exploration_node/rog_map/inf_occ
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /exploration_node/rog_map/map_bound
+      Name: map_bound
+      Namespaces:
+        Local Map Origin: true
+        Local Map Origin_text: true
+        Local Map Range: true
+        Local Map Range Text: true
+        Updating Range: true
+        Updating Range Text: true
+        Visualization Range: true
+        Visualization Range Text: true
+      Queue Size: 100
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 4.875
+        Min Value: 0.824999988079071
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 0; 170; 127
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: occ_map
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.10000000149011612
+      Style: Flat Squares
+      Topic: /exploration_node/rog_map/occ
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 46; 52; 54
@@ -411,7 +479,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 42.46694564819336
+      Distance: 193.91778564453125
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -419,17 +487,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -1.095047950744629
-        Y: -0.6340122222900391
-        Z: 5.055591106414795
+        X: -1.9623336791992188
+        Y: -18.635589599609375
+        Z: -17.468658447265625
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.5647960901260376
+      Pitch: 1.2797969579696655
       Target Frame: sensor
-      Yaw: 4.712770462036133
+      Yaw: 3.127747058868408
     Saved:
       - Class: rviz/ThirdPersonFollower
         Distance: 40.93450164794922

@@ -115,6 +115,35 @@ KnownFreeLongLength: 20.0
 VelocityShortKnownFree: 4.0
 VelocityMediumKnownFree: 8.0
 VelocityLongKnownFree: 12.0
+SafetyMapQueryStep: 0.20
+SafetyMapUnknownAsOccupiedForCommit: true
+SafetyMapUnknownAsOccupiedForBackup: true
+SafetyMapUnknownAllowedForExplore: true
+BrakeAccel: 20.0
+PlannerLatency: 0.12
+ControlLatency: 0.08
+SafetyBrakeMargin: 0.9
+CurvatureMinRadius: 0.9
+VelocityLogEnable: true
+HighSpeedModeThreshold: 5.0
+ViewScoreGainWeight: 1.0
+ViewScoreProgressWeight: 0.14
+ViewScoreVelocityAlignWeight: 2.2
+ViewScoreKnownFreeWeight: 0.22
+ViewScoreClearanceWeight: 0.45
+ViewScoreYawWeight: 0.20
+ViewScoreTurnWeight: 1.45
+ViewScoreBackupPenalty: 8.0
+ViewScoreKnownFreeMaxLen: 30.0
+EdgeTurnPenaltyWeight: 1.10
+EdgeKnownFreePenaltyWeight: 0.40
+EdgeBackupPenaltyWeight: 14.0
+EdgeYawPenaltyWeight: 0.18
+CorridorCruiseEnable: true
+CorridorCruiseKnownFreeLength: 20.0
+CorridorCruiseMinAlignment: 0.72
+CorridorCruiseForwardWeight: 0.45
+CorridorCruiseLateralPenalty: 14.0
 #param for yaw opt
 yaw_max_vel: 5.0 # 角速度限制, 要大
 yaw_rho_vis: 10000.0
