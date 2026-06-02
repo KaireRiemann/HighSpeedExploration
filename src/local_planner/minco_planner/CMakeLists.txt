@@ -10,6 +10,14 @@ set(CMAKE_CXX_FLAGS "-std=c++17")
 # set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall")
 
+# ROG-Map exposes public headers that depend on these compile definitions.
+add_definitions(
+  -DUSE_ROS1
+  -DORIGIN_AT_CORNER
+  -DFMT_HEADER_ONLY
+  -DROOT_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/../../map_manager/rog_map/\"
+)
+
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED COMPONENTS segmentation)
 link_directories(${PCL_LIBRARY_DIRS})
@@ -23,6 +31,7 @@ find_package(catkin REQUIRED COMPONENTS
   poly_traj
   pointcloud_topo
   path_searching
+  map_manager
 
   traj_utils
   cv_bridge
@@ -34,7 +43,7 @@ find_package(catkin REQUIRED COMPONENTS
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES plan_manage
-  CATKIN_DEPENDS pointcloud_topo path_searching traj_utils)
+  CATKIN_DEPENDS pointcloud_topo path_searching traj_utils map_manager)
 
 include_directories(
   include
@@ -72,5 +81,3 @@ add_library(plan_manage
   src/traj_opt/traj_manager.cpp
 )
 target_link_libraries(plan_manage ${catkin_LIBRARIES} )
-
-

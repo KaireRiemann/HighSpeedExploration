@@ -12,6 +12,8 @@
 	<node pkg="highspeed_exp" name="exploration_node" type="exploration_node"
 		output="screen">
 		<rosparam file="$(find highspeed_exp)/config/$(arg config_file)" command="load" />
+		<param name="RogMapEnable" value="true" type="bool" />
+		<param name="RogMapConfigPath" value="$(find highspeed_exp)/config/rog_map_highspeed.yaml" type="string" />
 		<!-- Fsm -->
 		<param name="fsm/thresh_replan" value="0.5" type="double" />
 		<param name="fsm/emergency_replan_control_error" value="1.5" type="double" />

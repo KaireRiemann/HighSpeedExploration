@@ -5,8 +5,16 @@ set(CMAKE_BUILD_TYPE "Release")
 # set(CMAKE_BUILD_TYPE "Debug")
 # set(CMAKE_BUILD_TYPE "RelWithDebInfo")
 
-set(CMAKE_CXX_FLAGS "-std=c++14")
+set(CMAKE_CXX_FLAGS "-std=c++17")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall")
+
+# ROG-Map public headers are used through plan_manage/planner_manager.h.
+add_definitions(
+  -DUSE_ROS1
+  -DORIGIN_AT_CORNER
+  -DFMT_HEADER_ONLY
+  -DROOT_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/../../map_manager/rog_map/\"
+)
 find_package(Eigen3 REQUIRED)
 find_package(PCL 1.7 REQUIRED)
 find_package(OpenMP REQUIRED)
@@ -30,6 +38,7 @@ find_package(catkin REQUIRED COMPONENTS
   traj_utils
   lkh_tsp_solver
   plan_manage
+  map_manager
   cv_bridge
   message_filters
 
@@ -38,7 +47,7 @@ find_package(catkin REQUIRED COMPONENTS
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES highspeed_exp
-  CATKIN_DEPENDS pointcloud_topo active_perception path_searching traj_utils lkh_tsp_solver plan_manage frontier_manager
+  CATKIN_DEPENDS pointcloud_topo active_perception path_searching traj_utils lkh_tsp_solver plan_manage map_manager frontier_manager
 
   # DEPENDS system_lib
 )

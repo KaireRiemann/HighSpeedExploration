@@ -256,6 +256,38 @@ double estimatePeakSpeed(const Trajectory<D> &traj, double dt) {
   }
   return peak;
 }
+
+struct PeakSpeedInfo {
+  double speed{0.0};
+  double time{0.0};
+};
+
+template <int D>
+PeakSpeedInfo estimatePeakSpeedInfo(const Trajectory<D> &traj, double dt,
+                                    double start_t = 0.0,
+                                    double end_t = std::numeric_limits<double>::infinity()) {
+  PeakSpeedInfo info;
+  if (traj.getPieceNum() <= 0) {
+    return info;
+  }
+  const double duration = traj.getTotalDuration();
+  if (!std::isfinite(duration) || duration <= 1.0e-6) {
+    return info;
+  }
+
+  double begin = std::clamp(start_t, 0.0, duration);
+  double end = std::clamp(end_t, begin, duration);
+  const double step = std::max(0.02, dt);
+  for (double t = begin; t <= end + 1.0e-6; t += step) {
+    const double sample_t = std::min(t, end);
+    const double speed = traj.getVel(sample_t).norm();
+    if (speed > info.speed) {
+      info.speed = speed;
+      info.time = sample_t;
+    }
+  }
+  return info;
+}
 }  // namespace
 
 // SECTION interfaces for setup and query
@@ -296,6 +328,23 @@ void FastPlannerManager::initPlanModules(
   gcopter_viz_->init(nh);
   gcopter_config_.reset(new GcopterConfig);
   gcopter_config_->init(nh);
+  map_manager_.reset(new general_planner::MapManager);
+  map_manager_->setEpicLioMap(lidar_map_interface_);
+  if (gcopter_config_->rogMapEnable) {
+    if (gcopter_config_->rogMapConfigPath.empty()) {
+      ROS_WARN("RogMapEnable=true but RogMapConfigPath is empty; ROG map disabled.");
+    } else {
+      try {
+        auto rog_map = std::make_shared<rog_map::ROGMapROS>(
+            nh, gcopter_config_->rogMapConfigPath);
+        map_manager_->setMap(rog_map);
+        ROS_INFO_STREAM("ROG map enabled with config: "
+                        << gcopter_config_->rogMapConfigPath);
+      } catch (const std::exception &e) {
+        ROS_ERROR_STREAM("Failed to initialize ROG map: " << e.what());
+      }
+    }
+  }
   traj_manager_.reset(new traj_opt::TrajManager);
   traj_manager_->setConfig(makeTrajOptConfig(*gcopter_config_));
 
@@ -438,6 +487,338 @@ double FastPlannerManager::timeToCommittedBackup() const {
   return local_data_.backup_start_t_ - curr_time;
 }
 
+double FastPlannerManager::committedTrajectoryRemainingTime() const {
+  if (local_data_.minco_traj_.getPieceNum() <= 0) {
+    return 0.0;
+  }
+  const double curr_time = (ros::Time::now() - local_data_.start_time_).toSec();
+  if (!std::isfinite(curr_time)) {
+    return 0.0;
+  }
+  return std::max(0.0, local_data_.duration_ - std::max(0.0, curr_time));
+}
+
+bool FastPlannerManager::isOnCommittedBackup() const {
+  if (!hasCommittedBackup()) {
+    return false;
+  }
+  const double curr_time = (ros::Time::now() - local_data_.start_time_).toSec();
+  return std::isfinite(curr_time) && curr_time >= local_data_.backup_start_t_;
+}
+
+bool FastPlannerManager::updateRogMap(
+    const sensor_msgs::PointCloud2ConstPtr &cloud_msg,
+    const nav_msgs::Odometry::ConstPtr &odom_msg) {
+  if (!gcopter_config_ || !gcopter_config_->rogMapEnable ||
+      !map_manager_ || !map_manager_->rawRosMap()) {
+    return false;
+  }
+
+  pcl::PointCloud<pcl::PointXYZ> input_cloud;
+  pcl::fromROSMsg(*cloud_msg, input_cloud);
+  if (input_cloud.empty() && lidar_map_interface_ &&
+      lidar_map_interface_->ld_) {
+    input_cloud = lidar_map_interface_->ld_->lidar_cloud_;
+  }
+  if (input_cloud.empty()) {
+    return false;
+  }
+
+  rog_map::PointCloud rog_cloud;
+  rog_cloud.reserve(input_cloud.size());
+  for (const auto &p : input_cloud.points) {
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+      continue;
+    }
+    rog_map::PointType rp;
+    rp.x = p.x;
+    rp.y = p.y;
+    rp.z = p.z;
+    rp.intensity = 1.0F;
+    rog_cloud.push_back(rp);
+  }
+  if (rog_cloud.empty()) {
+    return false;
+  }
+
+  const auto &pose = odom_msg->pose.pose;
+  super_utils::Pose rog_pose{
+      super_utils::Vec3f(pose.position.x, pose.position.y, pose.position.z),
+      super_utils::Quatf(pose.orientation.w, pose.orientation.x,
+                         pose.orientation.y, pose.orientation.z)};
+  map_manager_->rawRosMap()->updateMap(rog_cloud, rog_pose);
+  return true;
+}
+
+bool FastPlannerManager::isRogReady() const {
+  return gcopter_config_ && gcopter_config_->rogMapEnable &&
+         map_manager_ && map_manager_->ready(general_planner::MapBackend::ROG);
+}
+
+bool FastPlannerManager::isLioStateSafe(const Eigen::Vector3d &pos,
+                                        double safe_distance) const {
+  return pos.allFinite() && lidar_map_interface_ &&
+         lidar_map_interface_->getDisToOcc(pos) >= safe_distance;
+}
+
+bool FastPlannerManager::isLioSegmentSafe(const Eigen::Vector3d &start,
+                                          const Eigen::Vector3d &end,
+                                          double safe_distance,
+                                          double step) const {
+  if (!start.allFinite() || !end.allFinite()) {
+    return false;
+  }
+  const double length = (end - start).norm();
+  const int samples =
+      std::max(1, static_cast<int>(std::ceil(length / std::max(1.0e-3, step))));
+  for (int i = 0; i <= samples; ++i) {
+    const double ratio = static_cast<double>(i) / static_cast<double>(samples);
+    if (!isLioStateSafe(start + ratio * (end - start), safe_distance)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool FastPlannerManager::isStateKnownFree(const Eigen::Vector3d &pos,
+                                          double safe_distance) const {
+  if (!pos.allFinite()) {
+    return false;
+  }
+  const double lio_dist =
+      lidar_map_interface_ ? lidar_map_interface_->getDisToOcc(pos)
+                           : -std::numeric_limits<double>::infinity();
+  const bool lio_safe = lio_dist >= safe_distance;
+  if (!isRogReady()) {
+    return lio_safe;
+  }
+  const auto inf_state = map_manager_->getPolicyGridType(
+      pos, general_planner::MapBackend::ROG, true);
+  if (inf_state == rog_map::GridType::KNOWN_FREE) {
+    return map_manager_->isStateSafe(pos, safe_distance,
+                                     general_planner::MapBackend::ROG) ||
+           (gcopter_config_->rogKnownFreeFallbackToLio && lio_safe);
+  }
+
+  const auto raw_state = map_manager_->getPolicyGridType(
+      pos, general_planner::MapBackend::ROG, false);
+  const bool rog_unknown_like =
+      inf_state == rog_map::GridType::UNKNOWN ||
+      inf_state == rog_map::GridType::UNDEFINED ||
+      inf_state == rog_map::GridType::FRONTIER ||
+      inf_state == rog_map::GridType::OUT_OF_MAP ||
+      ((inf_state == rog_map::GridType::OCCUPIED) &&
+       (raw_state == rog_map::GridType::UNKNOWN ||
+        raw_state == rog_map::GridType::UNDEFINED ||
+        raw_state == rog_map::GridType::FRONTIER ||
+        raw_state == rog_map::GridType::OUT_OF_MAP));
+  if (gcopter_config_->rogKnownFreeFallbackToLio && lio_safe && rog_unknown_like) {
+    ROS_WARN_THROTTLE(2.0,
+                      "ROG known-free fallback to LIO is active: inf=%d raw=%d "
+                      "lio_dist=%.2f safe=%.2f pos=(%.2f, %.2f, %.2f)",
+                      static_cast<int>(inf_state), static_cast<int>(raw_state),
+                      lio_dist, safe_distance, pos.x(), pos.y(), pos.z());
+    return true;
+  }
+  ROS_WARN_THROTTLE(2.0,
+                    "Known-free reject: inf=%d raw=%d lio_dist=%.2f safe=%.2f "
+                    "pos=(%.2f, %.2f, %.2f)",
+                    static_cast<int>(inf_state), static_cast<int>(raw_state),
+                    lio_dist, safe_distance, pos.x(), pos.y(), pos.z());
+  return false;
+}
+
+bool FastPlannerManager::isSegmentKnownFree(const Eigen::Vector3d &start,
+                                            const Eigen::Vector3d &end,
+                                            double safe_distance,
+                                            double step) const {
+  if (!start.allFinite() || !end.allFinite()) {
+    return false;
+  }
+  const double length = (end - start).norm();
+  const int samples =
+      std::max(1, static_cast<int>(std::ceil(length / std::max(1.0e-3, step))));
+  for (int i = 0; i <= samples; ++i) {
+    const double ratio = static_cast<double>(i) / static_cast<double>(samples);
+    if (!isStateKnownFree(start + ratio * (end - start), safe_distance)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+double FastPlannerManager::estimateKnownFreePathLength(
+    const vector<Eigen::Vector3d> &path,
+    double safe_distance,
+    double step) const {
+  if (path.size() < 2) {
+    return 0.0;
+  }
+  double known_free_len = 0.0;
+  Eigen::Vector3d last = path.front();
+  if (!isStateKnownFree(last, safe_distance)) {
+    return 0.0;
+  }
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    const Eigen::Vector3d next = path[i];
+    const double seg_len = (next - last).norm();
+    if (seg_len < 1.0e-6) {
+      continue;
+    }
+    const int samples =
+        std::max(1, static_cast<int>(std::ceil(seg_len / std::max(1.0e-3, step))));
+    Eigen::Vector3d prev = last;
+    for (int s = 1; s <= samples; ++s) {
+      const double ratio = static_cast<double>(s) / static_cast<double>(samples);
+      const Eigen::Vector3d p = last + ratio * (next - last);
+      if (!isSegmentKnownFree(prev, p, safe_distance, step)) {
+        return known_free_len;
+      }
+      known_free_len += (p - prev).norm();
+      prev = p;
+    }
+    last = next;
+  }
+  return known_free_len;
+}
+
+double FastPlannerManager::estimateLioSafePathLength(
+    const vector<Eigen::Vector3d> &path,
+    double safe_distance,
+    double step) const {
+  if (path.size() < 2) {
+    return 0.0;
+  }
+  double safe_len = 0.0;
+  Eigen::Vector3d last = path.front();
+  if (!isLioStateSafe(last, safe_distance)) {
+    return 0.0;
+  }
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    const Eigen::Vector3d next = path[i];
+    const double seg_len = (next - last).norm();
+    if (seg_len < 1.0e-6) {
+      continue;
+    }
+    const int samples =
+        std::max(1, static_cast<int>(std::ceil(seg_len / std::max(1.0e-3, step))));
+    Eigen::Vector3d prev = last;
+    for (int s = 1; s <= samples; ++s) {
+      const double ratio = static_cast<double>(s) / static_cast<double>(samples);
+      const Eigen::Vector3d p = last + ratio * (next - last);
+      if (!isLioSegmentSafe(prev, p, safe_distance, step)) {
+        return safe_len;
+      }
+      safe_len += (p - prev).norm();
+      prev = p;
+    }
+    last = next;
+  }
+  return safe_len;
+}
+
+double FastPlannerManager::knownFreeAdaptiveVelocity(
+    double known_free_remaining) const {
+  if (!gcopter_config_) {
+    return 3.0;
+  }
+  const double v_min = std::max(0.5, gcopter_config_->minSegmentVel);
+  const double v_short =
+      std::clamp(gcopter_config_->velocityShortKnownFree, v_min,
+                 gcopter_config_->maxVelMag);
+  const double v_medium =
+      std::clamp(gcopter_config_->velocityMediumKnownFree, v_short,
+                 gcopter_config_->maxVelMag);
+  const double v_long =
+      std::clamp(gcopter_config_->velocityLongKnownFree, v_medium,
+                 gcopter_config_->maxVelMag);
+  if (known_free_remaining >= gcopter_config_->knownFreeLongLength) {
+    return v_long;
+  }
+  if (known_free_remaining >= gcopter_config_->knownFreeMediumLength) {
+    return v_medium;
+  }
+  if (known_free_remaining >= gcopter_config_->knownFreeShortLength) {
+    return std::min(v_medium, std::max(v_short, 0.5 * (v_short + v_medium)));
+  }
+  return v_short;
+}
+
+double FastPlannerManager::estimateCommittedKnownFreeSpan(
+    const Trajectory<7> &traj,
+    double &known_free_length) const {
+  known_free_length = 0.0;
+  if (traj.getPieceNum() <= 0 || !gcopter_config_) {
+    return 0.0;
+  }
+  const double duration = traj.getTotalDuration();
+  if (!std::isfinite(duration) || duration <= 1.0e-6) {
+    return 0.0;
+  }
+
+  const double safe_distance =
+      std::max(0.05, gcopter_config_->commitKnownFreeSafeDistance);
+  const double sample_dt = std::max(0.02, gcopter_config_->commitSampleDt);
+  Eigen::Vector3d last = traj.getPos(0.0);
+  if (!isStateKnownFree(last, safe_distance)) {
+    return 0.0;
+  }
+  double last_t = 0.0;
+  for (double t = sample_dt; t <= duration + 1.0e-6; t += sample_dt) {
+    const double tt = std::min(t, duration);
+    const Eigen::Vector3d p = traj.getPos(tt);
+    if (!isSegmentKnownFree(last, p, safe_distance, 0.5 * sample_dt *
+                                                std::max(1.0, traj.getVel(last_t).norm()))) {
+      return last_t;
+    }
+    known_free_length += (p - last).norm();
+    last = p;
+    last_t = tt;
+    if (tt >= duration) {
+      break;
+    }
+  }
+  return duration;
+}
+
+double FastPlannerManager::estimateCommittedLioSafeSpan(
+    const Trajectory<7> &traj,
+    double &safe_length) const {
+  safe_length = 0.0;
+  if (traj.getPieceNum() <= 0 || !gcopter_config_) {
+    return 0.0;
+  }
+  const double duration = traj.getTotalDuration();
+  if (!std::isfinite(duration) || duration <= 1.0e-6) {
+    return 0.0;
+  }
+
+  const double safe_distance =
+      std::max(0.05, gcopter_config_->commitKnownFreeSafeDistance);
+  const double sample_dt = std::max(0.02, gcopter_config_->commitSampleDt);
+  Eigen::Vector3d last = traj.getPos(0.0);
+  if (!isLioStateSafe(last, safe_distance)) {
+    return 0.0;
+  }
+  double last_t = 0.0;
+  for (double t = sample_dt; t <= duration + 1.0e-6; t += sample_dt) {
+    const double tt = std::min(t, duration);
+    const Eigen::Vector3d p = traj.getPos(tt);
+    const double step =
+        std::max(0.05, 0.5 * sample_dt * std::max(1.0, traj.getVel(last_t).norm()));
+    if (!isLioSegmentSafe(last, p, safe_distance, step)) {
+      return last_t;
+    }
+    safe_length += (p - last).norm();
+    last = p;
+    last_t = tt;
+    if (tt >= duration) {
+      break;
+    }
+  }
+  return duration;
+}
+
 Eigen::VectorXd FastPlannerManager::computeCorridorVelocityLimits(
     const vector<Eigen::MatrixX4d> &hPolys,
     const vector<Eigen::Vector3d> &path) const {
@@ -450,10 +831,54 @@ Eigen::VectorXd FastPlannerManager::computeCorridorVelocityLimits(
   const double v_min = std::max(0.5, gcopter_config_->minSegmentVel);
   const double v_open = std::min(gcopter_config_->maxVelMag,
                                  std::max(v_min, gcopter_config_->openSegmentVel));
-  if (!gcopter_config_->dynamicVelocityEnable) {
+  const bool use_known_free_velocity = isRogReady();
+  if (!gcopter_config_->dynamicVelocityEnable && !use_known_free_velocity) {
     limits.setConstant(v_open);
+    std::cout << "[vel diag] DynamicVelocityEnable=false, all segment limits="
+              << v_open << std::endl;
     return limits;
   }
+
+  int clearance_limited = 0;
+  int turn_limited = 0;
+  int visible_limited = 0;
+  int knownfree_limited = 0;
+  int open_limited = 0;
+  int min_idx = -1;
+  double min_limit = std::numeric_limits<double>::infinity();
+  double bottleneck_clearance = std::numeric_limits<double>::quiet_NaN();
+  double bottleneck_effective_clearance = std::numeric_limits<double>::quiet_NaN();
+  double min_turn_angle = 0.0;
+  double min_v_open = v_open;
+  double min_v_clearance = v_open;
+  double min_v_turn = v_open;
+  double min_v_visible = v_open;
+  double min_v_knownfree = v_open;
+  double min_knownfree_remaining = std::numeric_limits<double>::infinity();
+  const char *min_reason = "open";
+  double known_free_path_len =
+      use_known_free_velocity
+          ? estimateKnownFreePathLength(
+                path, std::max(0.05, gcopter_config_->commitKnownFreeSafeDistance),
+                std::max(0.05, gcopter_config_->commitSampleDt *
+                                    std::max(1.0, gcopter_config_->maxVelMag)))
+          : std::numeric_limits<double>::infinity();
+  if (use_known_free_velocity && gcopter_config_->rogKnownFreeFallbackToLio &&
+      known_free_path_len <
+          std::max(1.0, 0.5 * gcopter_config_->knownFreeShortLength)) {
+    const double lio_safe_path_len =
+        estimateLioSafePathLength(
+            path, std::max(0.05, gcopter_config_->commitKnownFreeSafeDistance),
+            std::max(0.05, gcopter_config_->commitSampleDt *
+                                std::max(1.0, gcopter_config_->maxVelMag)));
+    if (lio_safe_path_len > known_free_path_len + 1.0) {
+      std::cout << "[vel diag] use LIO safe path length fallback: "
+                << "rog_known_free_path_len=" << known_free_path_len
+                << " lio_safe_path_len=" << lio_safe_path_len << std::endl;
+      known_free_path_len = lio_safe_path_len;
+    }
+  }
+  double path_prefix_len = 0.0;
 
   for (int i = 0; i < limits.size(); ++i) {
     const Eigen::Vector3d travel_dir = pathHorizontalDirectionAt(path, i);
@@ -469,14 +894,15 @@ Eigen::VectorXd FastPlannerManager::computeCorridorVelocityLimits(
         std::isfinite(clearance) ? std::max(min_clearance, clearance - clearance_margin)
                                  : open_clearance;
     double v_clearance = v_open;
-    if (std::isfinite(clearance) && clearance < open_clearance) {
+    if (gcopter_config_->dynamicVelocityEnable &&
+        std::isfinite(clearance) && clearance < open_clearance) {
       v_clearance =
           0.92 * std::sqrt(2.0 * gcopter_config_->maxAccMag * effective_clearance);
     }
 
     const double turn_angle = turnAngleAt(path, i);
     double v_turn = v_open;
-    if (turn_angle > 0.15) {
+    if (gcopter_config_->dynamicVelocityEnable && turn_angle > 0.15) {
       const double turn_radius =
           std::isfinite(clearance) ? std::max(0.6, clearance) : open_clearance;
       v_turn = std::sqrt(std::max(0.1, gcopter_config_->maxAccMag * turn_radius /
@@ -489,10 +915,72 @@ Eigen::VectorXd FastPlannerManager::computeCorridorVelocityLimits(
     }
 
     const double v_visible =
-        std::sqrt(2.0 * gcopter_config_->maxAccMag *
-                  std::max(0.5, max_ray_length - gcopter_config_->dilateRadiusHard - 2.0));
-    limits(i) = std::clamp(std::min({v_open, v_clearance, v_turn, v_visible}),
-                           v_min, gcopter_config_->maxVelMag);
+        gcopter_config_->dynamicVelocityEnable
+            ? std::sqrt(2.0 * gcopter_config_->maxAccMag *
+                        std::max(0.5, max_ray_length -
+                                           gcopter_config_->dilateRadiusHard - 2.0))
+            : v_open;
+    const double knownfree_remaining =
+        use_known_free_velocity
+            ? std::max(0.0, known_free_path_len - path_prefix_len)
+            : std::numeric_limits<double>::infinity();
+    const double v_knownfree =
+        use_known_free_velocity ? knownFreeAdaptiveVelocity(knownfree_remaining)
+                                : v_open;
+    const double raw_limit =
+        std::min({v_open, v_clearance, v_turn, v_visible, v_knownfree});
+    limits(i) = std::clamp(raw_limit, v_min, gcopter_config_->maxVelMag);
+
+    const char *reason = "open";
+    if (raw_limit == v_clearance) {
+      reason = "clearance";
+      ++clearance_limited;
+    } else if (raw_limit == v_turn) {
+      reason = "turn";
+      ++turn_limited;
+    } else if (raw_limit == v_visible) {
+      reason = "visible";
+      ++visible_limited;
+    } else if (raw_limit == v_knownfree) {
+      reason = "known_free";
+      ++knownfree_limited;
+    } else {
+      ++open_limited;
+    }
+
+    if (limits(i) < min_limit) {
+      min_idx = i;
+      min_limit = limits(i);
+      bottleneck_clearance = clearance;
+      bottleneck_effective_clearance = effective_clearance;
+      min_turn_angle = turn_angle;
+      min_v_open = v_open;
+      min_v_clearance = v_clearance;
+      min_v_turn = v_turn;
+      min_v_visible = v_visible;
+      min_v_knownfree = v_knownfree;
+      min_knownfree_remaining = knownfree_remaining;
+      min_reason = reason;
+    }
+    if (i + 1 < static_cast<int>(path.size())) {
+      path_prefix_len += (path[i + 1] - path[i]).norm();
+    }
+  }
+  if (limits.size() > 0) {
+    std::cout << "[vel diag] segments=" << limits.size()
+              << " limited(open/clearance/turn/visible/knownfree)=" << open_limited
+              << "/" << clearance_limited << "/" << turn_limited << "/"
+              << visible_limited << "/" << knownfree_limited << " min_idx=" << min_idx
+              << " reason=" << min_reason
+              << " final=" << min_limit
+              << " known_free_path_len=" << known_free_path_len
+              << " known_free_remaining=" << min_knownfree_remaining
+              << " clearance=" << bottleneck_clearance
+              << " effective_clearance=" << bottleneck_effective_clearance
+              << " turn_angle=" << min_turn_angle
+              << " components(open/clearance/turn/visible/knownfree)=" << min_v_open
+              << "/" << min_v_clearance << "/" << min_v_turn << "/"
+              << min_v_visible << "/" << min_v_knownfree << std::endl;
   }
   return limits;
 }
@@ -518,10 +1006,78 @@ bool FastPlannerManager::generateBackupTrajectory(const Trajectory<7> &exp_traj,
     return true;
   }
 
-  const double max_start = std::min(gcopter_config_->backupMaxStartTime, exp_dur - 0.1);
-  backup_start_t = std::clamp(exp_dur * gcopter_config_->backupStartRatio,
-                              gcopter_config_->backupMinStartTime,
-                              std::max(gcopter_config_->backupMinStartTime, max_start));
+  double known_free_length = 0.0;
+  double known_free_end_t = estimateCommittedKnownFreeSpan(exp_traj, known_free_length);
+  bool use_lio_safe_span = false;
+  if (gcopter_config_->rogKnownFreeFallbackToLio &&
+      (!std::isfinite(known_free_end_t) || known_free_end_t <= 1.0e-4 ||
+       known_free_length <
+           std::max(1.0, 0.5 * gcopter_config_->knownFreeShortLength))) {
+    double lio_safe_length = 0.0;
+    const double lio_safe_end_t =
+        estimateCommittedLioSafeSpan(exp_traj, lio_safe_length);
+    if (std::isfinite(lio_safe_end_t) &&
+        lio_safe_end_t > std::max(1.0e-4, known_free_end_t + 0.15) &&
+        lio_safe_length > known_free_length + 1.0) {
+      std::cout << "[backup diag] use LIO safe span fallback: "
+                << "rog_known_free_t=" << known_free_end_t
+                << " lio_safe_t=" << lio_safe_end_t
+                << " lio_safe_len=" << lio_safe_length << std::endl;
+      known_free_end_t = lio_safe_end_t;
+      known_free_length = lio_safe_length;
+      use_lio_safe_span = true;
+    }
+  }
+  if (!std::isfinite(known_free_end_t) || known_free_end_t <= 1.0e-4) {
+    known_free_end_t = isRogReady() ? 0.0 : exp_dur;
+  }
+
+  const double adaptive_commit_max =
+      std::clamp(known_free_length /
+                     std::max(1.0, knownFreeAdaptiveVelocity(known_free_length)),
+                 gcopter_config_->commitMinDuration,
+                 gcopter_config_->commitMaxDuration);
+  const double max_start =
+      std::min({gcopter_config_->backupMaxStartTime,
+                gcopter_config_->commitMaxDuration,
+                adaptive_commit_max,
+                known_free_end_t - gcopter_config_->commitBackupTimeBuffer,
+                exp_dur - 0.1});
+  const double hard_min_start =
+      std::min(gcopter_config_->backupMinStartTime,
+               std::max({0.25, 3.0 * gcopter_config_->commitSampleDt,
+                         2.0 * gcopter_config_->backupSampleDt}));
+  const double effective_min_start =
+      std::min(gcopter_config_->backupMinStartTime,
+               std::max(hard_min_start,
+                        std::min(gcopter_config_->commitMinDuration, max_start)));
+  if (max_start < hard_min_start) {
+    std::cout << "[backup diag] known-free span too short for committed backup: "
+              << "known_free_t=" << known_free_end_t
+              << " known_free_len=" << known_free_length
+              << " max_start=" << max_start
+              << " adaptive_commit_max=" << adaptive_commit_max
+              << " hard_min_start=" << hard_min_start
+              << " configured_min_start=" << gcopter_config_->backupMinStartTime
+              << std::endl;
+    return false;
+  }
+  if (max_start < gcopter_config_->backupMinStartTime) {
+    std::cout << "[backup diag] short known-free commit horizon: "
+              << "known_free_t=" << known_free_end_t
+              << " known_free_len=" << known_free_length
+              << " max_start=" << max_start
+              << " adaptive_commit_max=" << adaptive_commit_max
+              << " effective_min_start=" << effective_min_start
+              << " configured_min_start=" << gcopter_config_->backupMinStartTime
+              << std::endl;
+  }
+
+  const double ratio_start = exp_dur * gcopter_config_->backupStartRatio;
+  backup_start_t = std::clamp(ratio_start,
+                              effective_min_start,
+                              std::max(effective_min_start, max_start));
+  backup_start_t = std::min(backup_start_t, known_free_end_t - 0.05);
   if (backup_start_t >= exp_dur - 0.05) {
     backup_start_t = exp_dur - 0.05;
   }
@@ -536,22 +1092,42 @@ bool FastPlannerManager::generateBackupTrajectory(const Trajectory<7> &exp_traj,
   double walked = 0.0;
   Eigen::Vector3d last_p = start_p;
   const double sample_dt = std::max(0.02, gcopter_config_->backupSampleDt);
-  for (double t = backup_start_t + sample_dt; t <= exp_dur + 1.0e-6; t += sample_dt) {
-    const double tt = std::min(t, exp_dur);
+  const double seed_search_end_t = std::min(exp_dur, known_free_end_t);
+  auto backupStateSafe = [&](const Eigen::Vector3d &p) {
+    return use_lio_safe_span
+               ? isLioStateSafe(p, gcopter_config_->commitKnownFreeSafeDistance)
+               : isStateKnownFree(p, gcopter_config_->commitKnownFreeSafeDistance);
+  };
+  auto backupSegmentSafe = [&](const Eigen::Vector3d &a, const Eigen::Vector3d &b,
+                               double step) {
+    return use_lio_safe_span
+               ? isLioSegmentSafe(a, b, gcopter_config_->commitKnownFreeSafeDistance, step)
+               : isSegmentKnownFree(a, b, gcopter_config_->commitKnownFreeSafeDistance,
+                                    step);
+  };
+  for (double t = backup_start_t + sample_dt; t <= seed_search_end_t + 1.0e-6; t += sample_dt) {
+    const double tt = std::min(t, seed_search_end_t);
     const Eigen::Vector3d p = exp_traj.getPos(tt);
-    const double dis_to_occ = lidar_map_interface_ ? lidar_map_interface_->getDisToOcc(p) : 10.0;
-    if (dis_to_occ < gcopter_config_->dilateRadiusHard + 0.15) {
+    if (!backupStateSafe(p)) {
       break;
     }
     walked += (p - last_p).norm();
     last_p = p;
     seed_t = tt;
-    if (walked >= stop_dist || tt >= exp_dur - 1.0e-6) {
+    if (walked >= stop_dist || tt >= seed_search_end_t - 1.0e-6) {
       break;
     }
   }
   if (seed_t <= backup_start_t + 0.15) {
-    seed_t = std::min(exp_dur, backup_start_t + 0.45);
+    seed_t = std::min(seed_search_end_t, backup_start_t + 0.45);
+  }
+  if (seed_t <= backup_start_t + 0.05) {
+    std::cout << "[backup diag] no known-free braking distance after backup start: "
+              << "backup_start=" << backup_start_t
+              << " known_free_t=" << known_free_end_t
+              << " speed_at_start=" << start_v.norm()
+              << " stop_dist=" << stop_dist << std::endl;
+    return false;
   }
 
   Eigen::Vector3d seed_p = exp_traj.getPos(seed_t);
@@ -622,23 +1198,53 @@ bool FastPlannerManager::generateBackupTrajectory(const Trajectory<7> &exp_traj,
   request.safe_corridor = hPolys;
   request.penalty_weights = makePenaltyWeights(*gcopter_config_, true);
   request.time_weight = gcopter_config_->WeightSafeT;
+  const double backup_vel_bound =
+      std::min(gcopter_config_->maxVelMag,
+               std::max(gcopter_config_->backupMaxVel, start_v.norm() + 0.5));
   request.min_total_time =
       std::max({0.35, start_v.norm() / brake_acc,
-                (seed_p - start_p).norm() / std::max(0.5, gcopter_config_->backupMaxVel)});
+                (seed_p - start_p).norm() / std::max(0.5, backup_vel_bound)});
   request.corridor_velocity_limits =
       Eigen::VectorXd::Constant(static_cast<int>(hPolys.size()),
-                                std::min(gcopter_config_->backupMaxVel,
-                                         gcopter_config_->maxVelMag));
+                                backup_vel_bound);
 
   if (!traj_manager_->optimize(request, backup_traj)) {
     std::cout << "backup optimize failed!" << std::endl;
     return false;
   }
+  const double allowed_backup_peak =
+      std::min(gcopter_config_->maxVelMag,
+               std::max(gcopter_config_->backupMaxVel, start_v.norm() + 0.5));
   if (backup_traj.getPieceNum() <= 0 ||
-      backup_traj.getMaxVelRate() > gcopter_config_->backupMaxVel + 2.0 ||
+      backup_traj.getMaxVelRate() > allowed_backup_peak + 1.0 ||
       backup_traj.getMaxAccRate() > gcopter_config_->backupMaxAcc + 5.0) {
-    std::cout << "backup magnitude check failed!" << std::endl;
+    std::cout << "backup magnitude check failed! peak_v="
+              << backup_traj.getMaxVelRate()
+              << " allowed_v=" << allowed_backup_peak
+              << " peak_a=" << backup_traj.getMaxAccRate()
+              << " allowed_a=" << gcopter_config_->backupMaxAcc
+              << " speed_at_start=" << start_v.norm()
+              << " known_free_len=" << known_free_length
+              << " known_free_t=" << known_free_end_t
+              << std::endl;
     return false;
+  }
+  const double backup_dur_check = backup_traj.getTotalDuration();
+  Eigen::Vector3d last_backup_p = start_p;
+  for (double t = 0.0; t <= backup_dur_check + 1.0e-6; t += sample_dt) {
+    const double tt = std::min(t, backup_dur_check);
+    const Eigen::Vector3d p = backup_traj.getPos(tt);
+    if (!backupSegmentSafe(
+            last_backup_p, p,
+            std::max(0.05, sample_dt * std::max(1.0, start_v.norm())))) {
+      std::cout << "[backup diag] optimized backup leaves known-free space at t="
+                << tt << std::endl;
+      return false;
+    }
+    last_backup_p = p;
+    if (tt >= backup_dur_check) {
+      break;
+    }
   }
 
   const double backup_dur = backup_traj.getTotalDuration();
@@ -785,7 +1391,34 @@ bool FastPlannerManager::planExploreTraj(const vector<Eigen::Vector3f> &path,
   max_bd[2] += 1.0;
 
   PointVector Searched_Points;
-  lidar_map_interface_->boxSearch(min_bd, max_bd, Searched_Points);
+  bool use_lio_corridor_points = true;
+  if (gcopter_config_->corridorUseRogOccPoints &&
+      isRogReady() && map_manager_ && map_manager_->rawMap()) {
+    rog_map::Vec3f rog_min = min_bd.cast<double>();
+    rog_map::Vec3f rog_max = max_bd.cast<double>();
+    rog_map::vec_E<rog_map::Vec3f> rog_occ_points;
+    map_manager_->rawMap()->boundBoxByLocalMap(rog_min, rog_max);
+    if ((rog_max - rog_min).minCoeff() > 0.0) {
+      map_manager_->rawMap()->boxSearch(
+          rog_min, rog_max, rog_map::GridType::OCCUPIED, rog_occ_points);
+    }
+    if (!rog_occ_points.empty()) {
+      Searched_Points.reserve(rog_occ_points.size());
+      for (const auto &p : rog_occ_points) {
+        Searched_Points.emplace_back(
+            static_cast<float>(p.x()), static_cast<float>(p.y()),
+            static_cast<float>(p.z()));
+      }
+      use_lio_corridor_points = false;
+      std::cout << "[corridor diag] use ROG raw occ points="
+                << Searched_Points.size() << std::endl;
+    }
+  }
+  if (use_lio_corridor_points && lidar_map_interface_) {
+    lidar_map_interface_->boxSearch(min_bd, max_bd, Searched_Points);
+    std::cout << "[corridor diag] use LIO occ points="
+              << Searched_Points.size() << std::endl;
+  }
 
   // 降采样
   std::vector<Eigen::Vector3d> surf_points;
@@ -864,8 +1497,7 @@ bool FastPlannerManager::planExploreTraj(const vector<Eigen::Vector3f> &path,
   int front = 0;
   int back = 1;
   while (back < hPolys.size() - 1) {
-    bool overlap = overlap =
-        geo_utils::overlap(hPolys[front], hPolys[back], 1e-2);
+    bool overlap = geo_utils::overlap(hPolys[front], hPolys[back], 1e-2);
     if (overlap) {
       front += 1;
       back += 1;
@@ -943,7 +1575,7 @@ bool FastPlannerManager::planExploreTraj(const vector<Eigen::Vector3f> &path,
   local_data_.start_time_ = hpoly_gen_end;
 
   double time = 10.0;
-  if (!checkTrajCollision(time) && time < 1.0) {
+  if (!gcopter_config_->backupTrajEnable && !checkTrajCollision(time) && time < 1.0) {
     std::cout << "check traj collision failed" << std::endl;
     local_data_ = local_data_backup;
     return false;
@@ -983,11 +1615,73 @@ bool FastPlannerManager::planExploreTraj(const vector<Eigen::Vector3f> &path,
     local_data_ = local_data_backup;
     return false;
   }
+  if (gcopter_config_->backupTrajEnable &&
+      exp_traj.getTotalDuration() > gcopter_config_->backupMinStartTime + 0.2 &&
+      !local_data_.backup_available_) {
+    std::cout << "backup required but committed trajectory has no backup!" << std::endl;
+    local_data_ = local_data_backup;
+    return false;
+  }
+  if (local_data_.backup_available_) {
+    const double sample_dt = std::max(0.02, gcopter_config_->commitSampleDt);
+    Eigen::Vector3d last_commit_p = local_data_.minco_traj_.getPos(0.0);
+    for (double t = sample_dt; t <= local_data_.duration_ + 1.0e-6; t += sample_dt) {
+      const double tt = std::min(t, local_data_.duration_);
+      const Eigen::Vector3d p = local_data_.minco_traj_.getPos(tt);
+      const double safety_step =
+          std::max(0.05, sample_dt *
+                             std::max(1.0, local_data_.minco_traj_.getVel(tt).norm()));
+      bool commit_segment_safe =
+          isSegmentKnownFree(last_commit_p, p,
+                             gcopter_config_->commitKnownFreeSafeDistance,
+                             safety_step);
+      if (!commit_segment_safe && gcopter_config_->rogKnownFreeFallbackToLio &&
+          isLioSegmentSafe(last_commit_p, p,
+                           gcopter_config_->commitKnownFreeSafeDistance,
+                           safety_step)) {
+        ROS_WARN_THROTTLE(2.0,
+                          "Committed trajectory check falls back to LIO safety.");
+        commit_segment_safe = true;
+      }
+      if (!commit_segment_safe) {
+        std::cout << "committed trajectory known-free check failed at t="
+                  << tt << std::endl;
+        local_data_ = local_data_backup;
+        return false;
+      }
+      last_commit_p = p;
+      if (tt >= local_data_.duration_) {
+        break;
+      }
+    }
+  }
+  const auto exp_peak = estimatePeakSpeedInfo(exp_traj, 0.02);
+  const auto commit_peak = estimatePeakSpeedInfo(local_data_.minco_traj_, 0.02);
   std::cout << "[traj opt] exp_duration=" << exp_traj.getTotalDuration()
-            << " exp_peak_v=" << estimatePeakSpeed(exp_traj, 0.05)
+            << " exp_peak_v=" << exp_peak.speed << "@" << exp_peak.time
             << " commit_duration=" << local_data_.duration_
-            << " commit_peak_v=" << estimatePeakSpeed(local_data_.minco_traj_, 0.05)
+            << " commit_peak_v=" << commit_peak.speed << "@" << commit_peak.time
             << " backup_start=" << local_data_.backup_start_t_ << std::endl;
+  if (local_data_.backup_available_) {
+    const auto exp_peak_before_backup =
+        estimatePeakSpeedInfo(exp_traj, 0.02, 0.0, backup_start_t);
+    const auto exp_peak_after_backup =
+        estimatePeakSpeedInfo(exp_traj, 0.02, backup_start_t,
+                              exp_traj.getTotalDuration());
+    const auto backup_peak = estimatePeakSpeedInfo(backup_traj, 0.02);
+    std::cout << "[backup diag] speed_at_start="
+              << exp_traj.getVel(backup_start_t).norm()
+              << " exp_peak_before=" << exp_peak_before_backup.speed << "@"
+              << exp_peak_before_backup.time
+              << " exp_peak_after=" << exp_peak_after_backup.speed << "@"
+              << exp_peak_after_backup.time
+              << " backup_duration=" << backup_traj.getTotalDuration()
+              << " backup_peak_v=" << backup_peak.speed << "@"
+              << backup_peak.time << std::endl;
+  } else {
+    std::cout << "[backup diag] backup disabled or unavailable; committed trajectory is exploration trajectory"
+              << std::endl;
+  }
 
   double commit_collision_time = 0.0;
   if (!checkTrajCollision(commit_collision_time)) {

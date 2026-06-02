@@ -138,6 +138,7 @@ void FastExplorationFSM::triggerCallback(const nav_msgs::PathConstPtr &msg) {
 void FastExplorationFSM::CloudOdomCallback(const sensor_msgs::PointCloud2ConstPtr &msg, const nav_msgs::Odometry::ConstPtr &odom_) {
   ros::Time t1 = ros::Time::now();
   planner_manager_->lidar_map_interface_->updateCloudMapOdometry(msg, odom_);
+  planner_manager_->updateRogMap(msg, odom_);
   double collision_time;
   bool safe = planner_manager_->checkTrajCollision(collision_time);
   if (!safe) {
@@ -167,7 +168,7 @@ void FastExplorationFSM::CloudOdomCallback(const sensor_msgs::PointCloud2ConstPt
   }
   ros::Time t4 = ros::Time::now();
 
-  ROS_INFO_STREAM_THROTTLE(1.0, "cloud odom callback cost: " << "ikd-tree insert:" << (t2 - t1).toSec() * 1000 << "ms  "
+  ROS_INFO_STREAM_THROTTLE(1.0, "cloud odom callback cost: " << "map update:" << (t2 - t1).toSec() * 1000 << "ms  "
                                                              << "update frontier clusters: " << (t4 - t3).toSec() * 1000 << "ms  "
                                                              << "total: " << (t4 - t1).toSec() * 1000 << "ms" << endl);
 }

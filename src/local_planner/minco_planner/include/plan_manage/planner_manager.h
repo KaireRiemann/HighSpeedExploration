@@ -17,10 +17,12 @@
 #include "misc/visualizer.hpp"
 
 #include <geometry_msgs/PoseStamped.h>
+#include <map_manager/map_manager.hpp>
 #include <nav_msgs/Odometry.h>
 #include <pointcloud_topo/graph.h>
 #include <pointcloud_topo/graph_visualizer.hpp>
 #include <pointcloud_topo/parallel_bubble_astar.h>
+#include <sensor_msgs/PointCloud2.h>
 #include <tf/tf.h>
 
 namespace fast_planner {
@@ -59,6 +61,10 @@ struct GcopterConfig {
   double yaw_rho_vis;
   double yaw_time_fwd;
   bool dynamicVelocityEnable;
+  bool rogMapEnable;
+  bool corridorUseRogOccPoints;
+  bool rogKnownFreeFallbackToLio;
+  std::string rogMapConfigPath;
   double minSegmentVel;
   double openSegmentVel;
   double dynamicVelocityMinClearance;
@@ -76,6 +82,17 @@ struct GcopterConfig {
   int backupPieceNum;
   double backupMaxVel;
   double backupMaxAcc;
+  double commitMinDuration;
+  double commitMaxDuration;
+  double commitSampleDt;
+  double commitKnownFreeSafeDistance;
+  double commitBackupTimeBuffer;
+  double knownFreeShortLength;
+  double knownFreeMediumLength;
+  double knownFreeLongLength;
+  double velocityShortKnownFree;
+  double velocityMediumKnownFree;
+  double velocityLongKnownFree;
 
   void init(const ros::NodeHandle &nh_priv) {
     nh_priv.getParam("DilateRadiusSoft", dilateRadiusSoft);
@@ -103,6 +120,10 @@ struct GcopterConfig {
     nh_priv.getParam("yaw_rho_vis", yaw_rho_vis);
     nh_priv.getParam("yaw_max_vel", yaw_max_vel);
     nh_priv.getParam("yaw_time_fwd", yaw_time_fwd);
+    nh_priv.param("RogMapEnable", rogMapEnable, true);
+    nh_priv.param("CorridorUseRogOccPoints", corridorUseRogOccPoints, false);
+    nh_priv.param("RogKnownFreeFallbackToLio", rogKnownFreeFallbackToLio, true);
+    nh_priv.param("RogMapConfigPath", rogMapConfigPath, std::string(""));
     nh_priv.param("DynamicVelocityEnable", dynamicVelocityEnable, true);
     nh_priv.param("MinSegmentVel", minSegmentVel, 2.5);
     nh_priv.param("OpenSegmentVel", openSegmentVel, maxVelMag);
@@ -122,6 +143,18 @@ struct GcopterConfig {
     nh_priv.param("BackupPieceNum", backupPieceNum, 2);
     nh_priv.param("BackupMaxVel", backupMaxVel, std::min(maxVelMag, 6.0));
     nh_priv.param("BackupMaxAcc", backupMaxAcc, maxAccMag);
+    nh_priv.param("CommitMinDuration", commitMinDuration, 0.45);
+    nh_priv.param("CommitMaxDuration", commitMaxDuration, 2.2);
+    nh_priv.param("CommitSampleDt", commitSampleDt, 0.05);
+    nh_priv.param("CommitKnownFreeSafeDistance", commitKnownFreeSafeDistance,
+                  dilateRadiusHard + 0.15);
+    nh_priv.param("CommitBackupTimeBuffer", commitBackupTimeBuffer, 0.15);
+    nh_priv.param("KnownFreeShortLength", knownFreeShortLength, 4.0);
+    nh_priv.param("KnownFreeMediumLength", knownFreeMediumLength, 10.0);
+    nh_priv.param("KnownFreeLongLength", knownFreeLongLength, 18.0);
+    nh_priv.param("VelocityShortKnownFree", velocityShortKnownFree, 4.0);
+    nh_priv.param("VelocityMediumKnownFree", velocityMediumKnownFree, 8.0);
+    nh_priv.param("VelocityLongKnownFree", velocityLongKnownFree, maxVelMag);
   }
 };
 
@@ -145,6 +178,10 @@ public:
   bool checkTrajVelocity();
   bool hasCommittedBackup() const;
   double timeToCommittedBackup() const;
+  double committedTrajectoryRemainingTime() const;
+  bool isOnCommittedBackup() const;
+  bool updateRogMap(const sensor_msgs::PointCloud2ConstPtr &cloud_msg,
+                    const nav_msgs::Odometry::ConstPtr &odom_msg);
 
   bool YawTrajOpt(double &start_yaw, double &end_yaw, bool is_static, bool use_shorten_path);
   bool YawTrajwithoutOpt(double &start_yaw, double &end_yaw, bool is_static, bool use_shorten_path);
@@ -170,6 +207,7 @@ public:
   LocalTrajData local_data_;
   double max_traj_len_;
   LIOInterface::Ptr lidar_map_interface_;
+  general_planner::MapManager::Ptr map_manager_;
   unique_ptr<Visualizer> gcopter_viz_;
   unique_ptr<GcopterConfig> gcopter_config_;
   unique_ptr<traj_opt::TrajManager> traj_manager_;
@@ -197,6 +235,28 @@ private:
 
   Eigen::VectorXd computeCorridorVelocityLimits(const vector<Eigen::MatrixX4d> &hPolys,
                                                 const vector<Eigen::Vector3d> &path) const;
+  bool isRogReady() const;
+  bool isLioStateSafe(const Eigen::Vector3d &pos, double safe_distance) const;
+  bool isLioSegmentSafe(const Eigen::Vector3d &start,
+                        const Eigen::Vector3d &end,
+                        double safe_distance,
+                        double step) const;
+  bool isStateKnownFree(const Eigen::Vector3d &pos, double safe_distance) const;
+  bool isSegmentKnownFree(const Eigen::Vector3d &start,
+                          const Eigen::Vector3d &end,
+                          double safe_distance,
+                          double step) const;
+  double estimateKnownFreePathLength(const vector<Eigen::Vector3d> &path,
+                                     double safe_distance,
+                                     double step) const;
+  double estimateLioSafePathLength(const vector<Eigen::Vector3d> &path,
+                                   double safe_distance,
+                                   double step) const;
+  double knownFreeAdaptiveVelocity(double known_free_remaining) const;
+  double estimateCommittedKnownFreeSpan(const Trajectory<7> &traj,
+                                        double &known_free_length) const;
+  double estimateCommittedLioSafeSpan(const Trajectory<7> &traj,
+                                      double &safe_length) const;
   bool generateBackupTrajectory(const Trajectory<7> &exp_traj,
                                 const Trajectory<5> &exp_yaw_traj,
                                 Trajectory<7> &backup_traj,

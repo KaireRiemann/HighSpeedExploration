@@ -64,8 +64,10 @@ dead_area_num: 0
 # trajectory param
 max_traj_len: 22.0
 DilateRadiusSoft: 0.7 # corridor inflation for optimization
-DilateRadiusHard: 0.55 # collision check threshold
+DilateRadiusHard: 0.45 # collision check threshold
 MaxCorridorSize: 5.0
+CorridorUseRogOccPoints: false
+RogKnownFreeFallbackToLio: true
 MaxVelMag: 12.0
 MaxAccMag: 20.0
 maxBdrMag: 10000.0
@@ -87,6 +89,12 @@ RelCostTol: 1.1e-6
 DynamicVelocityEnable: true
 MinSegmentVel: 2.5
 OpenSegmentVel: 12.0
+DynamicVelocityMinClearance: 0.25
+DynamicVelocityOpenClearance: 2.5
+DynamicVelocityClearanceMargin: 0.45
+NonstopTerminalVelocityEnable: true
+NonstopTerminalVelocityRatio: 0.70
+NonstopTerminalMinPathLength: 8.0
 BackupTrajEnable: true
 BackupStartRatio: 0.55
 BackupMinStartTime: 0.65
@@ -94,8 +102,19 @@ BackupMaxStartTime: 2.2
 BackupSampleDt: 0.08
 BackupSearchMargin: 4.0
 BackupPieceNum: 2
-BackupMaxVel: 6.0
+BackupMaxVel: 12.0
 BackupMaxAcc: 20.0
+CommitMinDuration: 0.50
+CommitMaxDuration: 2.4
+CommitSampleDt: 0.05
+CommitKnownFreeSafeDistance: 0.45
+CommitBackupTimeBuffer: 0.18
+KnownFreeShortLength: 4.0
+KnownFreeMediumLength: 10.0
+KnownFreeLongLength: 20.0
+VelocityShortKnownFree: 4.0
+VelocityMediumKnownFree: 8.0
+VelocityLongKnownFree: 12.0
 #param for yaw opt
 yaw_max_vel: 5.0 # 角速度限制, 要大
 yaw_rho_vis: 10000.0

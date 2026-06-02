@@ -110,7 +110,9 @@ void FastExplorationFSM::FSMCallback(const ros::TimerEvent &e) {
     } else if (res == FAIL) {
       double collision_time = 0.0;
       const bool safe = planner_manager_->checkTrajCollision(collision_time);
-      if (safe && planner_manager_->hasCommittedBackup()) {
+      const double remaining = planner_manager_->committedTrajectoryRemainingTime();
+      if (safe && planner_manager_->hasCommittedBackup() &&
+          remaining > std::max(0.15, fp_->replan_time_before_traj_end_)) {
         transitState(EXEC_TRAJ, "PLAN_TRAJ: plan failed, keep committed backup", true);
       } else {
         stopTraj();
@@ -244,11 +246,11 @@ void FastExplorationFSM::init(ros::NodeHandle &nh,
   nh.getParam("odometry_topic", odom_topic);
   nh.getParam("cloud_topic", cloud_topic);
   cloud_sub_.reset(new message_filters::Subscriber<sensor_msgs::PointCloud2>(
-      nh, cloud_topic, 1));
+      nh, cloud_topic, 10));
   odom_sub_.reset(
-      new message_filters::Subscriber<nav_msgs::Odometry>(nh, odom_topic, 5));
+      new message_filters::Subscriber<nav_msgs::Odometry>(nh, odom_topic, 1000));
   sync_cloud_odom_.reset(new message_filters::Synchronizer<SyncPolicyCloudOdom>(
-      SyncPolicyCloudOdom(10), *cloud_sub_, *odom_sub_));
+      SyncPolicyCloudOdom(1000), *cloud_sub_, *odom_sub_));
   sync_cloud_odom_->registerCallback(
       boost::bind(&FastExplorationFSM::CloudOdomCallback, this, _1, _2));
 }
